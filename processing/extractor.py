@@ -757,6 +757,20 @@ class LogProcessor:
             target_index=target_index
         )
 
+    def save_last_timestamp(self):
+        """保存最后处理的时间戳到文件"""
+        if self.last_processed_timestamp:
+            timestamp_file = os.path.join(self.output_dir, "last_timestamp.txt")
+            with open(timestamp_file, "w") as f:
+                f.write(self.last_processed_timestamp)
+
+    def load_last_timestamp(self):
+        """从文件加载最后处理的时间戳"""
+        timestamp_file = os.path.join(self.output_dir, "last_timestamp.txt")
+        if os.path.exists(timestamp_file):
+            with open(timestamp_file, "r") as f:
+                self.last_processed_timestamp = f.read().strip()
+
 
 # processing/__init__.py
 from .preprocessor import LogPreprocessor

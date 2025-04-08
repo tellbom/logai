@@ -138,7 +138,8 @@ class AppConfig:
                 "hybrid_search": {
                     "es_weight": 0.3,
                     "vector_weight": 0.7,
-                    "top_k": 10
+                    "top_k": 10,
+                    "rerank_url":"http://localhost:8091/rerank",  # 重排序服务URL
                 }
             }
         }

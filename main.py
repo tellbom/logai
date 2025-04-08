@@ -191,7 +191,8 @@ def initialize_components():
         embedding_model=embedding_model,
         es_weight=hybrid_search_config.get("es_weight", 0.3),
         vector_weight=hybrid_search_config.get("vector_weight", 0.7),
-        final_results_limit=hybrid_search_config.get("top_k", 20)
+        final_results_limit=hybrid_search_config.get("top_k", 20),
+        rerank_url = hybrid_search_config.get("rerank_url","http://localhost:8091/rerank")  # 您的重排序服务URL
     )
 
     # 初始化查询处理器
@@ -631,6 +632,32 @@ async def global_exception_handler(request: Request, exc: Exception):
         content={"status": "error", "message": str(exc)}
     )
 
+
+@app.post("/api/process_and_vectorize")
+def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = Depends(get_components)):
+    """
+    处理并向量化日志数据
+    """
+
+    # 使用后台任务，避免长时间运行的请求
+    def combined_task():
+        # 先处理日志
+        processed_df, summary = components["log_processor"].process_incremental(
+            time_window=timedelta(hours=1),
+            max_logs=10000,
+            save_to_file=True,
+            save_to_es=True
+        )
+        # 再向量化
+        if processed_df is not None and not processed_df.empty:
+            components["log_vectorizer"].process_dataframe(processed_df)
+
+        # 保存时间戳
+        components["log_processor"].save_last_timestamp()
+
+    background_tasks.add_task(combined_task)
+
+    return {"status": "success", "message": "增量处理和向量化任务已启动"}
 
 # 启动服务
 if __name__ == "__main__":
