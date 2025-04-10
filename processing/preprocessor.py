@@ -315,12 +315,12 @@ class LogPreprocessor:
 
         return kv_data
 
-    def normalize_abp_logs(self, df: pd.DataFrame, message_column: str = "message") -> pd.DataFrame:
+    def normalize_exceptions(self, df: pd.DataFrame, message_column: str = 'message') -> pd.DataFrame:
         """
-        专门针对ABP框架日志的标准化处理
+        针对各种类型的异常进行标准化处理
 
         Args:
-            df: 包含日志数据的DataFrame
+            df: 日志DataFrame
             message_column: 消息列名
 
         Returns:
@@ -332,23 +332,65 @@ class LogPreprocessor:
         # 创建副本
         result_df = df.copy()
 
-        # ABP特定的异常模式
-        abp_exception_pattern = r'(Volo\.Abp\.[A-Za-z\.]+Exception:.*?)(?=\s+---|\s+at\s+|$)'
+        # 通用异常模式
+        exception_patterns = [
+            # ABP框架
+            (r'(Volo\.Abp\.[A-Za-z\.]+Exception:.*?)(?=\s+---|\s+at\s+|$)', 'abp_exception'),
 
-        # 提取ABP异常类型
-        result_df["abp_exception_type"] = result_df[message_column].apply(
-            lambda x: self._extract_abp_exception_type(x) if isinstance(x, str) else ""
-        )
+            # 通用.NET异常
+            (r'(System\.[A-Za-z\.]+Exception:.*?)(?=\s+---|\s+at\s+|$)', 'system_exception'),
 
-        # 提取ABP模块名称
-        result_df["abp_module"] = result_df["abp_exception_type"].apply(
-            lambda x: self._extract_abp_module(x) if x else ""
-        )
+            # Java异常
+            (r'(java\.[A-Za-z\.]+Exception:.*?)(?=\s+at\s+|$)', 'java_exception'),
 
-        # 提取ABP异常消息
-        result_df["abp_exception_message"] = result_df[message_column].apply(
-            lambda x: self._extract_regex_group(x, abp_exception_pattern, 1) if isinstance(x, str) else ""
-        )
+            # Python异常
+            (r'(Traceback \(most recent call last\):[\s\S]*?(?:Error|Exception):.*?)(?=\n\n|\Z)', 'python_exception'),
+
+            # Node.js/JavaScript异常
+            (r'(Error:.*?)(?=\s+at\s+|$)', 'js_exception'),
+
+            # 自定义异常（可以根据需要添加）
+            (r'(CustomError:.*?)(?=\n|$)', 'custom_exception')
+        ]
+
+        # 提取异常类型和消息
+        for pattern, exception_type in exception_patterns:
+            # 创建匹配列（用于标记哪些行匹配此模式）
+            result_df[f'{exception_type}_match'] = result_df[message_column].str.contains(pattern, regex=True, na=False)
+
+            # 只处理匹配的行
+            matched_rows = result_df[result_df[f'{exception_type}_match']]
+            if not matched_rows.empty:
+                # 提取异常消息
+                result_df.loc[result_df[f'{exception_type}_match'], f'{exception_type}_message'] = \
+                    matched_rows[message_column].str.extract(pattern, expand=False)
+
+                # 提取异常类名（取第一个冒号前的部分）
+                result_df.loc[result_df[f'{exception_type}_match'], f'{exception_type}_class'] = \
+                    result_df.loc[result_df[f'{exception_type}_match'], f'{exception_type}_message'].str.split(':',
+                                                                                                               n=1).str[
+                        0]
+
+            # 删除临时匹配列
+            result_df = result_df.drop(columns=[f'{exception_type}_match'])
+
+        # 创建统一的异常字段
+        # 从各种特定类型的异常字段中提取信息，合并到通用字段
+        result_df['exception_type'] = None
+        result_df['exception_class'] = None
+        result_df['exception_message'] = None
+
+        # 按优先级填充通用异常字段
+        for pattern, exception_type in exception_patterns:
+            # 找到有此类异常的行
+            mask = result_df[f'{exception_type}_message'].notna()
+            if mask.any():
+                # 填充通用异常字段
+                result_df.loc[mask & result_df['exception_type'].isna(), 'exception_type'] = exception_type
+                result_df.loc[mask & result_df['exception_class'].isna(), 'exception_class'] = \
+                    result_df.loc[mask, f'{exception_type}_class']
+                result_df.loc[mask & result_df['exception_message'].isna(), 'exception_message'] = \
+                    result_df.loc[mask, f'{exception_type}_message']
 
         return result_df
 

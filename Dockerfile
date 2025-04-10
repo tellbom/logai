@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # 安装Python依赖
 # 设置 pip 使用阿里云的镜像源
-RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 

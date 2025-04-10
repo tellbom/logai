@@ -92,7 +92,7 @@ def normalize_unicode(text: str) -> str:
     return unicodedata.normalize('NFKC', text)
 
 
-def extract_keywords(text: str,
+def extract_keywords(text: stextract_keywordsr,
                      language: str = 'en',
                      max_keywords: int = 10,
                      min_word_length: int = 2) -> List[str]:

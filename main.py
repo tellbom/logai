@@ -445,21 +445,39 @@ def analyze_patterns(request: AnalysisRequest, components: Dict = Depends(get_co
 
 
 @app.post("/api/incremental_process")
-def incremental_process(background_tasks: BackgroundTasks, components: Dict = Depends(get_components)):
+def incremental_process(
+        background_tasks: BackgroundTasks,
+        components: Dict = Depends(get_components),
+        request: Optional[Dict[str, Any]] = None,
+):
     """
     启动增量处理
     """
+    if request is None:
+        request = {}
+
+    # 获取配置
+    config = get_config()
+
+    # 使用请求参数或配置值
+    source_index = request.get("source_index", config.get("elasticsearch.index_pattern"))
+    target_index = request.get("target_index", config.get("target_elasticsearch.index"))
+
     # 使用后台任务，避免长时间运行的请求
     background_tasks.add_task(
         components["log_processor"].process_incremental,
-        time_window=timedelta(hours=1),
-        max_logs=10000,
-        save_to_file=True,
-        save_to_es=True
+        time_window=timedelta(hours=request.get("hours", 1)),
+        max_logs=request.get("max_logs", 10000),
+        save_to_file=request.get("save_to_file", True),
+        save_to_es=request.get("save_to_es", True),
+        source_index_pattern=source_index,
+        target_index=target_index
     )
 
-    return {"status": "success", "message": "增量处理任务已启动"}
-
+    return {
+        "status": "success",
+        "message": f"增量处理任务已启动，源索引: {source_index}, 目标索引: {target_index}"
+    }
 
 @app.post("/api/update_prompt_template")
 def update_prompt_template(template: str = Body(..., embed=True), components: Dict = Depends(get_components)):
@@ -634,10 +652,19 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 @app.post("/api/process_and_vectorize")
-def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = Depends(get_components)):
+def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = Depends(get_components),request: Optional[Dict[str, Any]] = None):
     """
     处理并向量化日志数据
     """
+    if request is None:
+        request = {}
+
+        # 获取配置
+    config = get_config()
+
+    # 使用请求参数或配置值
+    source_index = request.get("source_index", config.get("elasticsearch.index_pattern"))
+    target_index = request.get("target_index", config.get("target_elasticsearch.index"))
 
     # 使用后台任务，避免长时间运行的请求
     def combined_task():
@@ -646,7 +673,9 @@ def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = 
             time_window=timedelta(hours=1),
             max_logs=10000,
             save_to_file=True,
-            save_to_es=True
+            save_to_es=True,
+        source_index_pattern=source_index,
+        target_index=target_index
         )
         # 再向量化
         if processed_df is not None and not processed_df.empty:
