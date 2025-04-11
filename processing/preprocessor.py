@@ -383,14 +383,17 @@ class LogPreprocessor:
         # 按优先级填充通用异常字段
         for pattern, exception_type in exception_patterns:
             # 找到有此类异常的行
-            mask = result_df[f'{exception_type}_message'].notna()
-            if mask.any():
-                # 填充通用异常字段
-                result_df.loc[mask & result_df['exception_type'].isna(), 'exception_type'] = exception_type
-                result_df.loc[mask & result_df['exception_class'].isna(), 'exception_class'] = \
-                    result_df.loc[mask, f'{exception_type}_class']
-                result_df.loc[mask & result_df['exception_message'].isna(), 'exception_message'] = \
-                    result_df.loc[mask, f'{exception_type}_message']
+            if f'{exception_type}_message' in result_df.columns:
+                mask = result_df[f'{exception_type}_message'].notna()
+                if mask.any():
+                    # 填充通用异常字段
+                    result_df.loc[mask & result_df['exception_type'].isna(), 'exception_type'] = exception_type
+                    result_df.loc[mask & result_df['exception_class'].isna(), 'exception_class'] = \
+                        result_df.loc[mask, f'{exception_type}_class']
+                    result_df.loc[mask & result_df['exception_message'].isna(), 'exception_message'] = \
+                        result_df.loc[mask, f'{exception_type}_message']
+            else:
+                continue
 
         return result_df
 
