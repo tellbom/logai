@@ -614,3 +614,47 @@ class HybridSearch:
             import traceback
             logger.error(traceback.format_exc())
             return []
+
+    def _add_relevance_info(self, query: str, results: List[Dict[str, Any]]) -> None:
+        """
+        为搜索结果添加相关性信息
+
+        Args:
+            query: 搜索查询
+            results: 搜索结果列表
+        """
+        if not results:
+            return
+
+        # 将查询拆分为关键词
+        query_terms = set(query.lower().split())
+
+        for result in results:
+            # 获取消息文本
+            message = result.get("message", "")
+
+            # 计算关键词匹配度
+            matched_terms = 0
+            for term in query_terms:
+                if term and len(term) > 2 and term in message.lower():
+                    matched_terms += 1
+
+            # 计算关键词覆盖率
+            keyword_coverage = matched_terms / len(query_terms) if query_terms else 0
+
+            # 添加相关性信息
+            result["relevance"] = {
+                "keyword_coverage": float(keyword_coverage),
+                "matched_terms": matched_terms,
+                "total_query_terms": len(query_terms)
+            }
+
+            # 简单分类相关性
+            if result.get("final_score", 0) > 0.8:
+                relevance_level = "high"
+            elif result.get("final_score", 0) > 0.5:
+                relevance_level = "medium"
+            else:
+                relevance_level = "low"
+
+            result["relevance"]["level"] = relevance_level
