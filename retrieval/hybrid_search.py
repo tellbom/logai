@@ -350,3 +350,267 @@ class HybridSearch:
         self._add_relevance_info(query, combined_results)
 
         return combined_results
+
+    def _prepare_es_filters(
+            self,
+            filters: Optional[Dict[str, Any]] = None,
+            time_range: Optional[Tuple[datetime, datetime]] = None,
+            services: Optional[List[str]] = None,
+            log_levels: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        准备ES过滤条件
+
+        Args:
+            filters: 自定义过滤条件
+            time_range: 时间范围
+            services: 服务列表
+            log_levels: 日志级别列表
+
+        Returns:
+            ES过滤条件列表
+        """
+        es_filters = []
+
+        # 时间范围过滤
+        if time_range:
+            start_time, end_time = time_range
+            time_filter = {
+                "range": {
+                    "@timestamp": {
+                        "gte": start_time.isoformat(),
+                        "lte": end_time.isoformat()
+                    }
+                }
+            }
+            es_filters.append(time_filter)
+
+        # 服务过滤
+        if services:
+            service_filter = {
+                "terms": {
+                    "service_name": services
+                }
+            }
+            es_filters.append(service_filter)
+
+        # 日志级别过滤
+        if log_levels:
+            level_filter = {
+                "terms": {
+                    "log_level": log_levels
+                }
+            }
+            es_filters.append(level_filter)
+
+        # 添加自定义过滤条件
+        if filters:
+            for field, value in filters.items():
+                if isinstance(value, list):
+                    filter_item = {"terms": {field: value}}
+                elif isinstance(value, dict) and ("gte" in value or "lte" in value):
+                    filter_item = {"range": {field: value}}
+                else:
+                    filter_item = {"term": {field: value}}
+
+                es_filters.append(filter_item)
+
+        return es_filters
+
+    def _prepare_vector_filters(
+            self,
+            filters: Optional[Dict[str, Any]] = None,
+            time_range: Optional[Tuple[datetime, datetime]] = None,
+            services: Optional[List[str]] = None,
+            log_levels: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        准备向量搜索过滤条件
+
+        Args:
+            filters: 自定义过滤条件
+            time_range: 时间范围
+            services: 服务列表
+            log_levels: 日志级别列表
+
+        Returns:
+            向量搜索过滤条件
+        """
+        vector_filters = {}
+
+        # 时间范围过滤
+        if time_range:
+            start_time, end_time = time_range
+            vector_filters["metadata.timestamp"] = {
+                "$gte": start_time.isoformat(),
+                "$lte": end_time.isoformat()
+            }
+
+        # 服务过滤
+        if services:
+            vector_filters["metadata.service_name"] = services
+
+        # 日志级别过滤
+        if log_levels:
+            vector_filters["metadata.log_level"] = log_levels
+
+        # 添加自定义过滤条件
+        if filters:
+            for field, value in filters.items():
+                vector_key = f"metadata.{field}"
+                if isinstance(value, dict) and ("gte" in value or "lte" in value):
+                    range_filter = {}
+                    if "gte" in value:
+                        range_filter["$gte"] = value["gte"]
+                    if "lte" in value:
+                        range_filter["$lte"] = value["lte"]
+                    vector_filters[vector_key] = range_filter
+                else:
+                    vector_filters[vector_key] = value
+
+        return vector_filters
+
+    def _search_vectors(
+            self,
+            query: str,
+            filters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        执行向量搜索
+
+        Args:
+            query: 搜索查询
+            filters: 过滤条件
+
+        Returns:
+            向量搜索结果列表
+        """
+        try:
+            # 清理查询文本
+            cleaned_query = clean_text(query)
+
+            # 生成查询向量
+            query_vector = self.embedding_model.embed([cleaned_query])[0]
+
+            # 执行向量搜索
+            vector_results = self.vector_store.search_similar(
+                query_vector=query_vector,
+                filter_conditions=filters,
+                limit=self.max_vector_results,
+                score_threshold=0.5  # 相似度阈值
+            )
+
+            # 处理结果
+            processed_results = []
+
+            for result in vector_results:
+                # 获取元数据
+                metadata = result.get("payload", {}).get("metadata", {})
+
+                processed_result = {
+                    "id": result.get("id", ""),
+                    "score": float(result.get("score", 0.0)),
+                    "source": "vector",
+                    "log_level": metadata.get("log_level", ""),
+                    "timestamp": metadata.get("timestamp", ""),
+                    "message": metadata.get("original_text", ""),
+                    "service_name": metadata.get("service_name", ""),
+                    "template": metadata.get("template", ""),
+                    "cluster_id": metadata.get("cluster_id", ""),
+                    "metadata": metadata
+                }
+
+                processed_results.append(processed_result)
+
+            logger.info(f"向量搜索返回 {len(processed_results)} 条结果")
+            return processed_results
+
+        except Exception as e:
+            logger.error(f"向量搜索失败: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []
+
+    def _search_es(
+            self,
+            query: str,
+            filters: Optional[List[Dict[str, Any]]] = None,
+            search_processed_index: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        执行ES搜索
+
+        Args:
+            query: 搜索查询
+            filters: 过滤条件
+            search_processed_index: 是否搜索处理后的索引
+
+        Returns:
+            ES搜索结果列表
+        """
+        try:
+            # 构建ES查询
+            es_query = {
+                "bool": {
+                    "must": [
+                        {
+                            "match": {
+                                "message": {
+                                    "query": query,
+                                    "operator": "and"
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+
+            # 添加过滤条件
+            if filters:
+                es_query["bool"]["filter"] = filters
+
+            # 确定搜索索引
+            index_pattern = "logai-processed" if search_processed_index else self.es_connector.es_index_pattern
+
+            # 执行搜索
+            search_results = self.es_connector.es_client.search(
+                index=index_pattern,
+                body={
+                    "query": es_query,
+                    "size": self.max_es_results,
+                    "sort": [
+                        {"_score": {"order": "desc"}},
+                        {"@timestamp": {"order": "desc"}}
+                    ]
+                }
+            )
+
+            # 处理结果
+            processed_results = []
+
+            for hit in search_results["hits"]["hits"]:
+                source = hit["_source"]
+
+                processed_result = {
+                    "id": hit["_id"],
+                    "score": float(hit["_score"]),
+                    "source": "elasticsearch",
+                    "log_level": source.get("log_level", ""),
+                    "timestamp": source.get("@timestamp", ""),
+                    "message": source.get("message", ""),
+                    "service_name": source.get("service_name", ""),
+                    "template": source.get("template", ""),
+                    "cluster_id": source.get("cluster_id", ""),
+                    "metadata": {k: v for k, v in source.items() if k not in ["message", "@timestamp"]}
+                }
+
+                processed_results.append(processed_result)
+
+            logger.info(f"ES搜索返回 {len(processed_results)} 条结果")
+            return processed_results
+
+        except Exception as e:
+            logger.error(f"ES搜索失败: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return []

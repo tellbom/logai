@@ -699,24 +699,22 @@ class LogProcessor:
         )
 
     def _get_latest_timestamp(self, index_pattern: str, is_source: bool = False) -> Optional[datetime.datetime]:
-        """
-        获取索引中最新记录的时间戳
-
-        Args:
-            index_pattern: 索引模式
-            is_source: 是否源数据库，True表示使用源ES连接器，False表示使用目标ES连接器
-
-        Returns:
-            最新时间戳或None
-        """
         try:
-            # 明确选择连接器
             connector = self.es_connector if is_source else self.target_es_connector
+            config = get_config()
+
+            # 获取配置的时间戳字段名
+            timestamp_field = config.get("field_mappings.timestamp_field", "@timestamp")
+
+            # 如果索引不存在则返回None
+            if not connector.es_client.indices.exists(index=index_pattern):
+                logger.info(f"索引 {index_pattern} 不存在")
+                return None
 
             query = {
                 "size": 1,
-                "sort": [{"@timestamp": {"order": "desc"}}],
-                "_source": ["@timestamp"]
+                "sort": [{timestamp_field: {"order": "desc"}}],
+                "_source": [timestamp_field]
             }
 
             result = connector.es_client.search(
@@ -725,7 +723,7 @@ class LogProcessor:
             )
 
             if result["hits"]["hits"]:
-                timestamp_str = result["hits"]["hits"][0]["_source"]["@timestamp"]
+                timestamp_str = result["hits"]["hits"][0]["_source"][timestamp_field]
                 return datetime.datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
 
             return None
