@@ -26,6 +26,26 @@ class ModelConfig:
         self.logai_config = self._get_logai_config()
         self.vectorization_config = self._get_vectorization_config()
 
+    def get(self, key: str, default: Any = None) -> Any:
+        """
+        获取配置值的方法
+
+        Args:
+            key: 配置键，例如"embedding"
+            default: 默认值
+
+        Returns:
+            配置值或默认值
+        """
+        if key == "embedding":
+            return self.embedding_config
+        elif key == "logai":
+            return self.logai_config
+        elif key == "vectorization":
+            return self.vectorization_config
+        else:
+            return default
+
     def _get_embedding_config(self) -> Dict[str, Any]:
         """
         获取嵌入模型配置
