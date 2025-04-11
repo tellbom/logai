@@ -27,6 +27,7 @@ class LogProcessor:
     def __init__(
             self,
             es_connector: ESConnector,
+            target_es_connector: ESConnector,
             output_dir: str = "./output",
             create_output_dir: bool = True
     ):
@@ -39,6 +40,7 @@ class LogProcessor:
             create_output_dir: 是否创建输出目录
         """
         self.es_connector = es_connector
+        self.target_es_connector = target_es_connector
         self.output_dir = output_dir
 
         # 创建输出目录
@@ -532,7 +534,7 @@ class LogProcessor:
             if target_index is None:
                 target_index = "logai-processed"
 
-            total, success = self.es_connector.save_to_new_index(
+            total, success = self.target_es_connector.save_to_new_index(
                 clustered_df,
                 target_index=target_index
             )
@@ -657,21 +659,19 @@ class LogProcessor:
         # 获取配置
         config = get_config()
 
-        # 确定源索引模式（优先级：参数 > 配置 > 实例默认值）
+        # 确定源索引模式和目标索引
         source_pattern = source_index_pattern or config.get(
             "elasticsearch.index_pattern") or self.es_connector.es_index_pattern
-
-        # 确定目标索引（优先级：参数 > 配置）
         target_idx = target_index or config.get("target_elasticsearch.index", "logai-processed")
 
-        # 其他逻辑保持不变
+        # 确定结束时间
         end_time = datetime.datetime.now()
 
         # 查询源ES的最新时间戳
-        source_latest = self._get_latest_timestamp(source_pattern)
+        source_latest = self._get_latest_timestamp(source_pattern, is_source=True)  # 使用源ES连接器
 
         # 查询目标ES的最新时间戳
-        target_latest = self._get_latest_timestamp(target_idx)
+        target_latest = self._get_latest_timestamp(target_idx, is_source=False)  # 使用目标ES连接器
 
         # 确定开始时间
         if target_latest:
@@ -698,17 +698,28 @@ class LogProcessor:
             target_index=target_idx
         )
 
+    def _get_latest_timestamp(self, index_pattern: str, is_source: bool = False) -> Optional[datetime.datetime]:
+        """
+        获取索引中最新记录的时间戳
 
-    def _get_latest_timestamp(self, index_pattern: str) -> Optional[datetime.datetime]:
-        """获取索引中最新记录的时间戳"""
+        Args:
+            index_pattern: 索引模式
+            is_source: 是否源数据库，True表示使用源ES连接器，False表示使用目标ES连接器
+
+        Returns:
+            最新时间戳或None
+        """
         try:
+            # 明确选择连接器
+            connector = self.es_connector if is_source else self.target_es_connector
+
             query = {
                 "size": 1,
                 "sort": [{"@timestamp": {"order": "desc"}}],
                 "_source": ["@timestamp"]
             }
 
-            result = self.es_connector.es_client.search(
+            result = connector.es_client.search(
                 index=index_pattern,
                 body=query
             )
@@ -721,7 +732,6 @@ class LogProcessor:
         except Exception as e:
             logger.warning(f"获取索引 {index_pattern} 最新时间戳失败: {str(e)}")
             return None
-
 
     def save_results(
             self,

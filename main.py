@@ -144,6 +144,18 @@ def initialize_components():
         verify_certs=es_config.get("verify_certs", False)
     )
 
+    # 初始化目标ES连接器（带IK分词器）
+    target_es_config = config.get("target_elasticsearch", {})
+    target_es_connector = ESConnector(
+        es_host=target_es_config.get("host", "localhost"),
+        es_port=target_es_config.get("port", 9200),
+        es_user=target_es_config.get("username"),
+        es_password=target_es_config.get("password"),
+        es_index_pattern=target_es_config.get("index", "logai-processed"),  # 注意这里使用index而非index_pattern
+        use_ssl=target_es_config.get("use_ssl", False),
+        verify_certs=target_es_config.get("verify_certs", False)
+    )
+
     # 初始化嵌入模型
     embedding_config = model_config.get("embedding", {})
     embedding_model = LocalSentenceTransformerEmbedding(
@@ -173,6 +185,7 @@ def initialize_components():
     # 初始化日志处理器
     log_processor = LogProcessor(
         es_connector=es_connector,
+        target_es_connector=target_es_connector,  # 需要修改LogProcessor类接受这个参数
         output_dir=config.get("app.output_dir", "./output")
     )
 
@@ -186,7 +199,7 @@ def initialize_components():
     retrieval_config = config.get("retrieval", {})
     hybrid_search_config = retrieval_config.get("hybrid_search", {})
     hybrid_search = HybridSearch(
-        es_connector=es_connector,
+        es_connector=target_es_connector,
         vector_store=vector_store,
         embedding_model=embedding_model,
         es_weight=hybrid_search_config.get("es_weight", 0.3),
