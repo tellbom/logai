@@ -14,7 +14,7 @@ class LogPreprocessor:
     def __init__(
             self,
             time_pattern: str = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}",
-            log_level_pattern: str = r"\[(DEBUG|INFO|WARN|WARNING|ERROR|FATAL|TRACE)\]",
+            log_level_pattern: str = r"\[(DEBUG|INFO|WARN|WARNING|ERROR|FATAL|ERR|TRACE)\]",
             exception_patterns: List[str] = [
                 r"Exception:",
                 r"Error:",
