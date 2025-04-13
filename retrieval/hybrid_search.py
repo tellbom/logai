@@ -266,87 +266,55 @@ class HybridSearch:
             logger.error(traceback.format_exc())
             return []
 
-    def _merge_final_results(
-            self,
-            query: str,
-            es_results: List[Dict[str, Any]],
-            vector_results: List[Dict[str, Any]],
-            reranked_results: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """
-        最终合并所有搜索结果
-
-        Args:
-            query: 原始查询
-            es_results: ES搜索结果
-            vector_results: 向量搜索结果
-            reranked_results: 重排序结果
-
-        Returns:
-            合并后的结果列表
-        """
-        # 创建ID到结果的映射
-        result_map = {}
-
-        # 处理ES结果
-        for result in es_results:
-            result_id = result["id"]
-            result_map[result_id] = {
-                **result,
-                "es_score": result["score"],
-                "vector_score": 0.0,
-                "rerank_score": 0.0,
-                "final_score": self.es_weight * result["score"]  # 初始得分只包含ES部分
-            }
-
-        # 处理向量结果
-        for result in vector_results:
-            result_id = result["id"]
-
-            if result_id in result_map:
-                # 如果结果已存在，更新分数
-                result_map[result_id]["vector_score"] = result["score"]
-                result_map[result_id]["final_score"] += self.vector_weight * result["score"]
-            else:
-                # 新结果
-                result_map[result_id] = {
-                    **result,
-                    "es_score": 0.0,
-                    "vector_score": result["score"],
-                    "rerank_score": 0.0,
-                    "final_score": self.vector_weight * result["score"]  # 初始得分只包含向量部分
-                }
-
-        # 处理重排序结果
-        for result in reranked_results:
-            result_id = result["id"]
-
-            if result_id in result_map:
-                # 更新重排序分数
-                result_map[result_id]["rerank_score"] = result["rerank_score"]
-                result_map[result_id]["final_score"] += self.rerank_weight * result["rerank_score"]
-            else:
-                # 这种情况理论上不应该发生，因为重排序基于初始结果
-                result_map[result_id] = {
-                    **result,
-                    "es_score": result.get("es_score", 0.0),
-                    "vector_score": result.get("vector_score", 0.0),
-                    "rerank_score": result["rerank_score"],
-                    "final_score": self.rerank_weight * result["rerank_score"]
-                }
-
-        # 转换为列表并排序
+    def _merge_final_results(self, query: str, es_results: List[Dict], vector_results: List[Dict],
+                             reranked_results: List[Dict]) -> List[Dict]:
+        """改进的结果合并算法"""
+        # 创建基础合并结果
+        result_map = self._create_base_result_map(es_results, vector_results, reranked_results)
         combined_results = list(result_map.values())
-        combined_results.sort(key=lambda x: x["final_score"], reverse=True)
 
-        # 限制结果数量
+        if not combined_results:
+            return []
+
+        # 计算动态权重
+        es_weight, vector_weight, rerank_weight = self._get_dynamic_weights(query, es_results, vector_results)
+
+        # 计算TF-IDF相关性
+        tfidf_scores = self._calculate_tfidf_relevance(query, combined_results)
+
+        # 计算上下文分数
+        context_scores = self._calculate_context_score(combined_results)
+
+        # 整合所有分数
+        for result in combined_results:
+            # 基础分数
+            base_score = (
+                    es_weight * result.get("es_score", 0.0) +
+                    vector_weight * result.get("vector_score", 0.0) +
+                    rerank_weight * result.get("rerank_score", 0.0)
+            )
+
+            # 日志级别权重
+            level_importance = self._get_level_importance(result.get("log_level", "INFO"))
+
+            # TF-IDF相关性
+            tfidf_score = tfidf_scores.get(result["id"], 0.0)
+
+            # 上下文相关性
+            context_score = context_scores.get(result["id"], 1.0)
+
+            # 最终分数计算
+            result["final_score"] = base_score * (
+                        0.7 + 0.1 * level_importance + 0.1 * tfidf_score + 0.1 * context_score)
+
+        # 排序和限制结果
+        combined_results.sort(key=lambda x: x["final_score"], reverse=True)
         combined_results = combined_results[:self.final_results_limit]
 
-        # 添加排名字段
+        # 添加排名和相关性信息
         for i, result in enumerate(combined_results):
             result["rank"] = i + 1
 
-        # 增加相关性分析
         self._add_relevance_info(query, combined_results)
 
         return combined_results
@@ -658,3 +626,184 @@ class HybridSearch:
                 relevance_level = "low"
 
             result["relevance"]["level"] = relevance_level
+
+    def _get_dynamic_weights(self, query: str, es_results: List[Dict], vector_results: List[Dict]) -> Tuple[
+        float, float, float]:
+        """根据查询特征动态调整权重"""
+        query_lower = query.lower()
+
+        # 如果查询更像是关键词搜索(短查询，包含特定术语)
+        if len(query.split()) <= 3 or any(
+                term in query_lower for term in ['error', 'exception', 'fail', '错误', '异常']):
+            return 0.5, 0.3, 0.2  # 提高ES权重
+
+        # 如果查询更像是语义问题(长句子，疑问句)
+        elif len(query.split()) >= 5 or query_lower.endswith('?') or '什么' in query_lower or '如何' in query_lower:
+            return 0.2, 0.6, 0.2  # 提高向量权重
+
+        # 默认权重
+        return self.es_weight, self.vector_weight, self.rerank_weight
+
+    def _calculate_context_score(self, results: List[Dict]) -> Dict[str, float]:
+        """计算上下文相关性分数"""
+        # 提取时间戳并按时间排序
+        timestamps = [(i, result.get("timestamp")) for i, result in enumerate(results) if result.get("timestamp")]
+        timestamps.sort(key=lambda x: x[1])
+
+        context_scores = {result["id"]: 1.0 for result in results}
+
+        # 为时间接近的文档增加权重
+        for i in range(len(timestamps) - 1):
+            curr_idx, curr_time = timestamps[i]
+            next_idx, next_time = timestamps[i + 1]
+
+            # 如果两条日志时间接近(例如5分钟内)
+            time_diff = (next_time - curr_time).total_seconds()
+            if time_diff < 300:  # 5分钟
+                boost = 1.0 - (time_diff / 300) * 0.2  # 时间越接近，提升越大
+                context_scores[results[curr_idx]["id"]] += boost
+                context_scores[results[next_idx]["id"]] += boost
+
+        return context_scores
+
+    def _calculate_tfidf_relevance(self, query: str, results: List[Dict]) -> Dict[str, float]:
+        """使用TF-IDF计算查询与结果的相关性"""
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        # 提取所有消息文本
+        docs = [result.get("message", "") for result in results]
+        if not docs:
+            return {}
+
+        # 添加查询到文档集合
+        all_docs = [query] + docs
+
+        # TF-IDF向量化
+        vectorizer = TfidfVectorizer(min_df=1, stop_words='english')
+        tfidf_matrix = vectorizer.fit_transform(all_docs)
+
+        # 计算查询与每个文档的余弦相似度
+        query_vector = tfidf_matrix[0:1]
+        doc_vectors = tfidf_matrix[1:]
+
+        from sklearn.metrics.pairwise import cosine_similarity
+        similarities = cosine_similarity(query_vector, doc_vectors).flatten()
+
+        # 创建ID到相似度的映射
+        tfidf_scores = {}
+        for i, result in enumerate(results):
+            tfidf_scores[result["id"]] = float(similarities[i])
+
+        return tfidf_scores
+
+    def _get_level_importance(self, log_level: str) -> float:
+        """根据日志级别返回重要性权重"""
+        importance_map = {
+            "FATAL": 1.0,
+            "ERROR": 0.9,
+            "WARN": 0.7,
+            "WARNING": 0.7,
+            "INFO": 0.5,
+            "DEBUG": 0.3,
+            "TRACE": 0.2
+        }
+        return importance_map.get(log_level.upper(), 0.5)
+
+    def _add_temporal_analysis(self, results: List[Dict]) -> None:
+        """添加时序关系分析"""
+        if len(results) < 2:
+            return
+
+        # 按时间排序
+        time_sorted = sorted(results, key=lambda x: x.get("timestamp", ""))
+
+        # 标记时间邻近的记录
+        for i in range(len(time_sorted) - 1):
+            curr = time_sorted[i]
+            next_log = time_sorted[i + 1]
+
+            if "timestamp" in curr and "timestamp" in next_log:
+                try:
+                    curr_time = datetime.fromisoformat(curr["timestamp"].replace("Z", "+00:00"))
+                    next_time = datetime.fromisoformat(next_log["timestamp"].replace("Z", "+00:00"))
+
+                    time_diff = (next_time - curr_time).total_seconds()
+
+                    if time_diff < 60:  # 1分钟内
+                        if "temporal_relations" not in curr:
+                            curr["temporal_relations"] = []
+                        if "temporal_relations" not in next_log:
+                            next_log["temporal_relations"] = []
+
+                        curr["temporal_relations"].append({"id": next_log["id"], "time_diff": time_diff})
+                        next_log["temporal_relations"].append({"id": curr["id"], "time_diff": -time_diff})
+                except:
+                    pass
+
+    def _create_base_result_map(
+            self,
+            es_results: List[Dict[str, Any]],
+            vector_results: List[Dict[str, Any]],
+            reranked_results: List[Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        创建基础结果映射，合并来自不同来源的结果
+
+        Args:
+            es_results: ES搜索结果
+            vector_results: 向量搜索结果
+            reranked_results: 重排序结果
+
+        Returns:
+            ID到结果的映射字典
+        """
+        result_map = {}
+
+        # 处理ES结果
+        for result in es_results:
+            result_id = result["id"]
+            result_map[result_id] = {
+                **result,
+                "es_score": result["score"],
+                "vector_score": 0.0,
+                "rerank_score": 0.0,
+                "final_score": self.es_weight * result["score"]  # 初始得分只包含ES部分
+            }
+
+        # 处理向量结果
+        for result in vector_results:
+            result_id = result["id"]
+
+            if result_id in result_map:
+                # 如果结果已存在，更新分数
+                result_map[result_id]["vector_score"] = result["score"]
+                result_map[result_id]["final_score"] += self.vector_weight * result["score"]
+            else:
+                # 新结果
+                result_map[result_id] = {
+                    **result,
+                    "es_score": 0.0,
+                    "vector_score": result["score"],
+                    "rerank_score": 0.0,
+                    "final_score": self.vector_weight * result["score"]  # 初始得分只包含向量部分
+                }
+
+        # 处理重排序结果
+        for result in reranked_results:
+            result_id = result["id"]
+
+            if result_id in result_map:
+                # 更新重排序分数
+                result_map[result_id]["rerank_score"] = result["rerank_score"]
+                result_map[result_id]["final_score"] += self.rerank_weight * result["rerank_score"]
+            else:
+                # 这种情况理论上不应该发生，因为重排序基于初始结果
+                result_map[result_id] = {
+                    **result,
+                    "es_score": result.get("es_score", 0.0),
+                    "vector_score": result.get("vector_score", 0.0),
+                    "rerank_score": result["rerank_score"],
+                    "final_score": self.rerank_weight * result["rerank_score"]
+                }
+
+        return result_map
