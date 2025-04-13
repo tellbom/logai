@@ -325,6 +325,19 @@ def generate_prompt(query: PromptQuery, components: Dict = Depends(get_component
 
     return result
 
+# 定义请求模型
+class QueryRequest(BaseModel):
+    query: str
+@app.post('/api/parse_time')
+def parse_time_api(request: QueryRequest, components: Dict = Depends(get_components)):
+    """
+    解析时间信息
+    """
+    # 使用 `components["query_processor"]` 调用方法
+    template = components["query_processor"].generate_time_parsing_prompt(request.query)
+
+    # 返回生成的模板（prompt）
+    return {"prompt": template}
 
 @app.post("/api/dify_workflow")
 def generate_dify_workflow_data(query: DifyWorkflowQuery, components: Dict = Depends(get_components)):

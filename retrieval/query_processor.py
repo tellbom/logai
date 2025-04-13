@@ -438,3 +438,77 @@ class QueryProcessor:
             "status": "success",
             "workflow_data": workflow_data
         }
+
+    def generate_time_parsing_prompt( self,query: str) -> str:
+        """
+        生成用于解析时间表达式的提示词
+
+        Args:
+            query: 用户查询文本
+
+        Returns:
+            用于LLM的提示词
+        """
+        prompt = f"""
+        你是一个专门解析时间表达式的助手。你的任务是从用户查询中提取时间信息，并以JSON格式返回,不要携带除JSON以外任何内容。
+        从以下查询中提取时间相关信息，并转换为具体的时间范围:
+
+        查询: "{query}"
+
+        请以JSON格式返回，包含以下字段:
+        - has_time_reference: 布尔值，表示是否包含时间引用
+        - start_time: 开始时间(ISO格式)
+        - end_time: 结束时间(ISO格式)
+        - time_type: "absolute"(具体时间点) 或 "relative"(相对时间)
+        - original_expression: 原始时间表达式
+
+        如果查询不包含时间引用，则has_time_reference为false，其余字段为null。
+
+        当前日期是：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+        示例1:
+        查询: "今天有什么报错信息"
+        返回:
+        {{
+        "has_time_reference": true,
+          "start_time": "2025-04-13T00:00:00",
+          "end_time": "2025-04-13T23:59:59",
+          "time_type": "relative",
+          "original_expression": "今天"
+        }}
+
+        示例2:
+        查询: "14点到19点之间的错误日志"
+        返回:
+        {{
+        "has_time_reference": true,
+          "start_time": "2025-04-13T14:00:00",
+          "end_time": "2025-04-13T19:00:00",
+          "time_type": "absolute",
+          "original_expression": "14点到19点之间"
+        }}
+
+        示例3:
+        查询: "最近3小时的系统警告"
+        返回:
+         {{
+        "has_time_reference": true,
+          "start_time": "2025-04-13T11:30:00",
+          "end_time": "2025-04-13T14:30:00",
+          "time_type": "relative",
+          "original_expression": "最近3小时"
+        }}
+
+        示例4:
+        查询: "显示服务器错误日志"
+        返回:
+        {{
+        "has_time_reference": false,
+          "start_time": null,
+          "end_time": null,
+          "time_type": null,
+          "original_expression": null
+        }}
+        """
+
+        return prompt

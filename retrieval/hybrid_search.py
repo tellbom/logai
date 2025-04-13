@@ -525,7 +525,8 @@ class HybridSearch:
                             "match": {
                                 "message": {
                                     "query": query,
-                                    "operator": "and"
+                                     "operator": "or",
+                                     "minimum_should_match": "30%"
                                 }
                             }
                         }
