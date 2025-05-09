@@ -80,6 +80,22 @@ class HybridSearch:
 
         logger.info(f"混合搜索初始化，ES权重: {es_weight}, 向量权重: {vector_weight}, 重排序权重: {rerank_weight}")
 
+    def set_weights(self, es_weight: float, vector_weight: float):
+        """设置混合搜索的权重参数
+
+        Args:
+            es_weight: Elasticsearch搜索的权重
+            vector_weight: 向量搜索的权重
+        """
+        # 校验权重
+        if 0.0 <= es_weight <= 1.0 and 0.0 <= vector_weight <= 1.0:
+            self.es_weight = es_weight
+            self.vector_weight = vector_weight
+            logger.info(f"已更新搜索权重: ES={es_weight}, Vector={vector_weight}")
+        else:
+            logger.warning(f"权重设置无效，需在0-1范围内: ES={es_weight}, Vector={vector_weight}")
+            logger.warning(f"保持原有权重: ES={self.es_weight}, Vector={self.vector_weight}")
+
     def search(
             self,
             query: str,

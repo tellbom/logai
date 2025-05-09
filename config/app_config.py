@@ -66,11 +66,11 @@ class AppConfig:
 
             # elasticsearch配置 - 源库（日志数据库）
             "elasticsearch": {
-                "host": "192.168.140.100",
+                "host": "192.168.48.128",
                 "port": 9200,
                 "username": None,
                 "password": None,
-                "index_pattern": "logstash-*",
+                "index_pattern": "abp-logs-*",
                 "use_ssl": False,
                 "verify_certs": False,
                 "timeout": 60,
@@ -79,8 +79,8 @@ class AppConfig:
 
             # elasticsearch目标库配置（带IK分词器）
             "target_elasticsearch": {
-                "host": "192.168.140.100",
-                "port": 9300,
+                "host": "192.168.48.128",
+                "port": 9200,
                 "username": None,
                 "password": None,
                 "index": "logai-processed",
@@ -91,7 +91,7 @@ class AppConfig:
 
             # Qdrant向量数据库配置
             "qdrant": {
-                "host": "124.71.225.73",
+                "host": "192.168.48.128",
                 "port": 6333,
                 "grpc_port": 6334,
                 "api_key": None,
@@ -147,7 +147,7 @@ class AppConfig:
                     "es_weight": 0.3,
                     "vector_weight": 0.7,
                     "top_k": 10,
-                    "rerank_url":"http://192.168.140.100:8091/rerank",  # 重排序服务URL
+                    "rerank_url":"http://192.168.48.128:8091/rerank",  # 重排序服务URL
                 }
             }
         }

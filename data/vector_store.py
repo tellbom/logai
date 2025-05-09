@@ -249,19 +249,40 @@ class QdrantVectorStore:
         Returns:
             Qdrant过滤器对象
         """
+        import datetime
+        import re
+
         filter_conditions = []
+
+        # 时间戳字段模式，用于识别时间相关字段
+        timestamp_pattern = re.compile(r'timestamp|time|date', re.IGNORECASE)
 
         for field, value in conditions.items():
             # 处理不同类型的条件
             if isinstance(value, dict):
                 # 范围条件 {"metadata.timestamp": {"$gte": "2023-01-01", "$lte": "2023-12-31"}}
                 for op, op_value in value.items():
+                    # 检查是否需要转换时间字符串
+                    is_timestamp_field = timestamp_pattern.search(field) is not None
+                    converted_value = op_value
+
+                    # 对时间字符串进行转换
+                    if is_timestamp_field and isinstance(op_value, str):
+                        try:
+                            # 尝试将ISO时间字符串转换为Unix时间戳（秒）
+                            dt = datetime.datetime.fromisoformat(op_value.replace('Z', '+00:00'))
+                            converted_value = dt.timestamp()  # 转换为数值时间戳
+                            logger.debug(f"将时间字符串 '{op_value}' 转换为时间戳 {converted_value}")
+                        except Exception as e:
+                            logger.warning(f"时间戳转换失败 '{op_value}': {str(e)}")
+
+                    # 根据操作符构建过滤条件
                     if op == "$gte":
                         filter_conditions.append(
                             qdrant_models.FieldCondition(
                                 key=field,
                                 range=qdrant_models.Range(
-                                    gte=op_value
+                                    gte=converted_value
                                 )
                             )
                         )
@@ -270,11 +291,46 @@ class QdrantVectorStore:
                             qdrant_models.FieldCondition(
                                 key=field,
                                 range=qdrant_models.Range(
-                                    lte=op_value
+                                    lte=converted_value
                                 )
                             )
                         )
+                    elif op == "$gt":
+                        filter_conditions.append(
+                            qdrant_models.FieldCondition(
+                                key=field,
+                                range=qdrant_models.Range(
+                                    gt=converted_value
+                                )
+                            )
+                        )
+                    elif op == "$lt":
+                        filter_conditions.append(
+                            qdrant_models.FieldCondition(
+                                key=field,
+                                range=qdrant_models.Range(
+                                    lt=converted_value
+                                )
+                            )
+                        )
+                    elif op == "$eq":
+                        filter_conditions.append(
+                            qdrant_models.FieldCondition(
+                                key=field,
+                                match=qdrant_models.MatchValue(value=converted_value)
+                            )
+                        )
+                    elif op == "$ne":
+                        # 不等于需要使用must_not
+                        filter_conditions.append(
+                            qdrant_models.FieldCondition(
+                                key=field,
+                                match=qdrant_models.MatchValue(value=converted_value),
+                                must_not=True
+                            )
+                        )
                     # 可以添加其他操作符支持
+
             elif isinstance(value, list):
                 # 列表条件 {"metadata.log_level": ["ERROR", "FATAL"]}
                 filter_conditions.append(
@@ -285,10 +341,21 @@ class QdrantVectorStore:
                 )
             else:
                 # 单值条件 {"metadata.cluster_id": 5}
+                # 检查是否是时间戳值需要转换
+                is_timestamp_field = timestamp_pattern.search(field) is not None
+                converted_value = value
+
+                if is_timestamp_field and isinstance(value, str):
+                    try:
+                        dt = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+                        converted_value = dt.timestamp()  # 转换为数值时间戳
+                    except Exception as e:
+                        logger.warning(f"单值时间戳转换失败 '{value}': {str(e)}")
+
                 filter_conditions.append(
                     qdrant_models.FieldCondition(
                         key=field,
-                        match=qdrant_models.MatchValue(value=value)
+                        match=qdrant_models.MatchValue(value=converted_value)
                     )
                 )
 

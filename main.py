@@ -104,6 +104,21 @@ class AnalysisRequest(BaseModel):
     services: Optional[List[str]] = None
     log_levels: Optional[List[str]] = None
 
+class WeightUpdateRequest(BaseModel):
+    es_weight: float = Field(0.0, ge=0.0, le=1.0)
+    vector_weight: float = Field(0.0, ge=0.0, le=1.0)
+
+# 请求和响应模型
+class QueryClassificationRequest(BaseModel):
+    query: str
+    context: Optional[str] = None
+
+class QueryClassificationResponse(BaseModel):
+    success: bool
+    query: str
+    system_prompt: str
+    user_prompt: str
+
 
 # 全局组件实例
 es_connector = None
@@ -338,6 +353,150 @@ def parse_time_api(request: QueryRequest, components: Dict = Depends(get_compone
 
     # 返回生成的模板（prompt）
     return {"prompt": template}
+
+
+@app.post("/api/classify_query")
+def classify_query_endpoint(request: QueryClassificationRequest) -> QueryClassificationResponse:
+    """提供查询分类所需的提示词和内容，专为C# ABP框架日志优化"""
+
+    query = request.query
+
+    # 为C# ABP框架日志优化的系统提示词
+    system_prompt = """
+    你是一个专业的日志查询分析器，专注于C# ABP框架的日志分析。你的任务是分析用户的查询意图，并确定在混合检索系统中使用的最佳权重。
+
+    请分析查询的语义和意图，然后确定它属于以下哪种类型：
+    1. 错误定位型查询：寻找特定错误、异常、堆栈跟踪或错误代码的查询
+    2. 性能分析型查询：与响应时间、延迟、超时或性能瓶颈相关的查询
+    3. 安全审计型查询：寻找授权失败、身份验证问题或安全警告的查询
+    4. 流程跟踪型查询：跟踪特定请求、事务或用户会话流程的查询
+    5. 依赖服务型查询：与外部服务、API调用或数据库交互相关的查询
+    6. 通用型查询：不属于以上类别的一般性查询
+
+    对于不同类型的查询，应分配不同的检索权重：
+    - 错误定位型查询：词汇匹配(0.7)更重要，因为异常名称和错误消息有特定格式
+    - 性能分析型查询：词汇匹配(0.4)和语义匹配(0.6)结合，因为性能问题描述多样
+    - 安全审计型查询：词汇匹配(0.6)更重要，安全日志通常有固定模式
+    - 流程跟踪型查询：语义匹配(0.7)更重要，因为需要理解整体流程上下文
+    - 依赖服务型查询：词汇匹配(0.5)和语义匹配(0.5)平衡，涉及特定服务名和概念
+    - 通用型查询：语义匹配(0.7)更重要，词汇匹配(0.3)次之
+
+    请分析查询并返回JSON格式的结果，不要携带任何MarkDown格式形式，包含以下字段：
+    - query_type: 查询类型(error_locating, performance, security_audit, process_tracing, dependency_service, general)
+    - vector_weight: 语义匹配权重(0.0-1.0)
+    - lexical_weight: 词汇匹配权重(0.0-1.0)
+    - reasoning: 你的分析理由(简短说明)
+    """
+
+    # 构建用户提示词
+    user_prompt = f"""
+    请分析以下用户在C# ABP框架日志系统中的查询，确定查询类型并推荐合适的检索权重：
+
+    用户查询: "{query}"
+
+    请以JSON格式返回结果。只返回JSON对象，不要有其他说明文字。
+    """
+
+    # 返回提示词和查询
+    return QueryClassificationResponse(
+        success=True,
+        query=query,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt
+    )
+
+
+class WeightUpdateRequest(BaseModel):
+    es_weight: Optional[float] = Field(None, ge=0.0, le=1.0, description="ES搜索权重")
+    vector_weight: Optional[float] = Field(None, ge=0.0, le=1.0, description="向量搜索权重")
+    weights_config: Optional[Union[Dict[str, Any], str]] = Field(None,
+                                                                 description="LLM分析的权重配置，可以是JSON字符串或字典")
+
+
+@app.post("/api/update_search_weights")
+def update_search_weights(
+        request: WeightUpdateRequest,
+        components: Dict = Depends(get_components)
+):
+    """更新混合搜索权重，支持直接指定权重或使用LLM分析结果"""
+    import json
+
+    hybrid_search = components["hybrid_search"]
+
+    # 记录原始权重
+    old_weights = {
+        "es_weight": hybrid_search.es_weight,
+        "vector_weight": hybrid_search.vector_weight
+    }
+
+    # 确定新权重
+    new_es_weight = old_weights["es_weight"]
+    new_vector_weight = old_weights["vector_weight"]
+    reasoning = ""
+    query_type = ""
+
+    # 优先使用直接指定的权重
+    if request.es_weight is not None:
+        new_es_weight = request.es_weight
+
+    if request.vector_weight is not None:
+        new_vector_weight = request.vector_weight
+
+    # 如果提供了LLM分析的权重配置
+    weights_config = request.weights_config
+    if weights_config:
+        try:
+            # 如果是字符串(JSON文本)，尝试解析成字典
+            if isinstance(weights_config, str):
+                weights_config = json.loads(weights_config)
+
+            # 从LLM分析结果中提取权重
+            vector_weight = float(weights_config.get('vector_weight', new_vector_weight))
+            lexical_weight = float(weights_config.get('lexical_weight', new_es_weight))
+            query_type = weights_config.get('query_type', 'general')
+            reasoning = weights_config.get('reasoning', '')
+
+            # 使用LLM分析的权重
+            new_vector_weight = vector_weight
+            new_es_weight = lexical_weight
+
+            logger.info(
+                f"使用LLM分析的查询权重: vector={vector_weight}, lexical={lexical_weight}, type={query_type}"
+            )
+        except Exception as e:
+            logger.error(f"解析LLM权重配置时出错: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"解析权重配置失败: {str(e)}",
+                "old_weights": old_weights
+            }
+
+    # 更新权重
+    hybrid_search.set_weights(
+        es_weight=new_es_weight,
+        vector_weight=new_vector_weight
+    )
+
+    # 构建响应
+    response = {
+        "status": "success",
+        "message": "搜索权重已更新",
+        "old_weights": old_weights,
+        "new_weights": {
+            "es_weight": hybrid_search.es_weight,
+            "vector_weight": hybrid_search.vector_weight
+        }
+    }
+
+    # 如果使用了LLM分析，添加相关信息
+    if query_type or reasoning:
+        response["analysis"] = {
+            "query_type": query_type,
+            "reasoning": reasoning,
+            "source": "llm_analysis"
+        }
+
+    return response
 
 @app.post("/api/dify_workflow")
 def generate_dify_workflow_data(query: DifyWorkflowQuery, components: Dict = Depends(get_components)):

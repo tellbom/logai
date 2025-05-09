@@ -184,17 +184,134 @@ class LogProcessor:
         templates = []
         template_ids = []
 
-        for _, log in df.iterrows():
-            result = template_miner.add_log_message(log[content_column])
-            template_ids.append(result.cluster_id)
+        # 调试信息
+        first_result = None
 
-            # 如果是新模板，添加到列表
-            if result.is_new_cluster:
-                templates.append(result.template_mined)
+        for idx, log in df.iterrows():
+            try:
+                result = template_miner.add_log_message(log[content_column])
 
-        # 更新DataFrame
-        df["template"] = df[content_column].apply(lambda x: template_miner.match(x).get_template())
-        df["template_id"] = template_ids
+                # 保存第一个结果用于调试
+                if first_result is None:
+                    first_result = result
+                    logger.debug(f"Drain3 返回结果类型: {type(result)}")
+                    if isinstance(result, dict):
+                        logger.debug(f"Drain3 返回字典键: {list(result.keys())}")
+
+                # 获取cluster_id，尝试不同的访问方式
+                cluster_id = None
+                if isinstance(result, dict):
+                    # 尝试各种可能的键名
+                    if "cluster_id" in result:
+                        cluster_id = result["cluster_id"]
+                    elif "cluster" in result:
+                        cluster_id = result["cluster"]
+                    elif "id" in result:
+                        cluster_id = result["id"]
+                    else:
+                        # 如果找不到合适的键，使用索引作为ID
+                        cluster_id = idx
+                else:
+                    # 尝试作为对象访问
+                    try:
+                        cluster_id = result.cluster_id
+                    except AttributeError:
+                        try:
+                            cluster_id = result.cluster
+                        except AttributeError:
+                            try:
+                                cluster_id = result.id
+                            except AttributeError:
+                                cluster_id = idx
+
+                template_ids.append(cluster_id)
+
+                # 获取是否是新模板
+                is_new = False
+                if isinstance(result, dict):
+                    # 尝试各种可能的键名
+                    if "is_new_cluster" in result:
+                        is_new = result["is_new_cluster"]
+                    elif "is_new" in result:
+                        is_new = result["is_new"]
+                    elif "new" in result:
+                        is_new = result["new"]
+                else:
+                    # 尝试作为对象访问
+                    try:
+                        is_new = result.is_new_cluster
+                    except AttributeError:
+                        try:
+                            is_new = result.is_new
+                        except AttributeError:
+                            try:
+                                is_new = result.new
+                            except AttributeError:
+                                pass
+
+                # 获取模板
+                template = None
+                if isinstance(result, dict):
+                    # 尝试各种可能的键名
+                    if "template_mined" in result:
+                        template = result["template_mined"]
+                    elif "template" in result:
+                        template = result["template"]
+                    elif "pattern" in result:
+                        template = result["pattern"]
+                else:
+                    # 尝试作为对象访问
+                    try:
+                        template = result.template_mined
+                    except AttributeError:
+                        try:
+                            template = result.template
+                        except AttributeError:
+                            try:
+                                template = result.pattern
+                            except AttributeError:
+                                template = log[content_column]  # 使用原始消息作为后备
+
+                # 如果是新模板，添加到列表
+                if is_new and template:
+                    templates.append(template)
+
+            except Exception as e:
+                logger.warning(f"处理日志 {idx} 时出错: {str(e)}")
+                template_ids.append(idx)  # 使用索引作为后备ID
+
+        # 直接使用每条日志内容作为模板（如果正常解析失败）
+        if not templates:
+            logger.warning("未能提取有效模板，使用日志内容作为模板")
+            templates = df[content_column].unique().tolist()
+            df["template"] = df[content_column]
+            df["template_id"] = template_ids
+        else:
+            # 尝试安全地提取模板
+            try:
+                def extract_template(x):
+                    try:
+                        match_result = template_miner.match(x)
+                        if isinstance(match_result, dict):
+                            if "template" in match_result:
+                                return match_result["template"]
+                            elif "pattern" in match_result:
+                                return match_result["pattern"]
+                        else:
+                            try:
+                                return match_result.get_template()
+                            except:
+                                return match_result.template if hasattr(match_result, "template") else x
+                    except:
+                        return x  # 如果失败，返回原始文本
+
+                df["template"] = df[content_column].apply(extract_template)
+                df["template_id"] = template_ids
+            except Exception as e:
+                logger.error(f"提取模板时出错: {str(e)}")
+                # 降级方案
+                df["template"] = df[content_column]
+                df["template_id"] = template_ids
 
         return df, templates
 
