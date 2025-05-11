@@ -1,0 +1,33 @@
+# 基础框架
+fastapi>=0.95.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+requests>=2.28.0
+
+# 数据处理
+pandas>=1.5.0
+numpy>=1.22.0
+scikit-learn>=1.0.0
+statsmodels>=0.13.0
+drain3>=0.9.2  # 用于日志模板提取
+
+# 数据库连接
+elasticsearch>=7.17.0,<8.0.0
+qdrant-client>=1.1.1
+
+# 自然语言处理
+sentence-transformers>=2.2.2
+transformers>=4.26.0
+torch>=2.0.0
+jieba>=0.42.1
+
+# 图表生成
+matplotlib>=3.5.0
+networkx>=2.7.0
+
+# 日志分析
+logai>=0.1.5
+
+# 工具
+pyyaml>=6.0
+python-dateutil>=2.8.2
