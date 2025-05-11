@@ -15,6 +15,8 @@ from sklearn.preprocessing import StandardScaler
 
 from data.es_connector import ESConnector
 from utils import get_logger, clean_text
+from deduplication import LogDeduplicator
+
 
 from config import get_config, get_model_config
 
@@ -58,6 +60,16 @@ class LogProcessor:
         # 初始化模板存储
         self.template_store = {}
         self.cluster_store = {}
+
+        # 初始化日志去重器
+        self.deduplicator = LogDeduplicator(
+            similarity_threshold=0.92,
+            time_window_hours=2,
+            min_cluster_size=2,
+            novelty_threshold=0.05,
+            keep_latest_count=3,
+            keep_anomalies=True
+        )
 
         logger.info("日志处理器初始化完成")
 
@@ -548,7 +560,8 @@ class LogProcessor:
             save_to_file: bool = True,
             save_to_es: bool = True,
             target_index: Optional[str] = None,
-            preprocess: bool = True
+            preprocess: bool = True,
+            deduplication: bool = True  # 添加这个参数
     ) -> Tuple[pd.DataFrame, Dict]:
         """
         提取并处理日志的便捷方法
@@ -600,6 +613,25 @@ class LogProcessor:
             logs_df = preprocessor.normalize_exceptions(logs_df)
             logger.info("执行了异常日志标准化")
 
+        # 如果启用去重，在解析日志前进行智能聚类去重
+        if deduplication and not logs_df.empty:
+            original_count = len(logs_df)
+
+            # 确保日志具有向量表示
+            if 'vector' not in logs_df.columns and hasattr(self, 'embedding_model'):
+                # 调用嵌入模型获取向量
+                from processing.vectorizer import LogVectorizer
+                vectorizer = LogVectorizer(self.embedding_model)
+                logs_df = vectorizer.add_vectors_to_df(logs_df, content_column='message')
+
+            # 应用智能聚类去重
+            if 'vector' in logs_df.columns:
+                logs_df = self.deduplicator.smart_cluster_deduplication(logs_df)
+                dedup_count = original_count - len(logs_df)
+                logger.info(f"日志去重完成: 从{original_count}条日志中去除了{dedup_count}条重复日志")
+            else:
+                logger.warning("日志数据缺少向量表示，无法执行智能去重")
+
         # 解析日志
         parsed_df, parsing_summary = self.parse_logs(logs_df)
 
@@ -614,6 +646,7 @@ class LogProcessor:
 
         end_process_time = datetime.datetime.now()
         process_duration = (end_process_time - start_process_time).total_seconds()
+
 
         # 更新最后处理的时间戳
         if not clustered_df.empty and "@timestamp" in clustered_df.columns:

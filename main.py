@@ -104,9 +104,6 @@ class AnalysisRequest(BaseModel):
     services: Optional[List[str]] = None
     log_levels: Optional[List[str]] = None
 
-class WeightUpdateRequest(BaseModel):
-    es_weight: float = Field(0.0, ge=0.0, le=1.0)
-    vector_weight: float = Field(0.0, ge=0.0, le=1.0)
 
 # 请求和响应模型
 class QueryClassificationRequest(BaseModel):
@@ -118,6 +115,22 @@ class QueryClassificationResponse(BaseModel):
     query: str
     system_prompt: str
     user_prompt: str
+
+# 去重配置请求模型
+class DeduplicationConfigRequest(BaseModel):
+    enabled: bool = True
+    similarity_threshold: Optional[float] = None
+    novelty_threshold: Optional[float] = None
+    time_window_hours: Optional[int] = None
+    min_cluster_size: Optional[int] = None
+    keep_latest_count: Optional[int] = None
+    keep_anomalies: Optional[bool] = None
+
+class WeightUpdateRequest(BaseModel):
+    es_weight: Optional[float] = Field(None, ge=0.0, le=1.0, description="ES搜索权重")
+    vector_weight: Optional[float] = Field(None, ge=0.0, le=1.0, description="向量搜索权重")
+    weights_config: Optional[Union[Dict[str, Any], str]] = Field(None,
+                                                                 description="LLM分析的权重配置，可以是JSON字符串或字典")
 
 
 # 全局组件实例
@@ -242,6 +255,27 @@ def initialize_components():
         min_confidence=0.6
     )
 
+    # 初始化日志处理器时传入去重配置
+    log_processor = LogProcessor(
+        es_connector=es_connector,
+        target_es_connector=target_es_connector,
+        output_dir=config.get("app.output_dir", "./output")
+    )
+
+    # 从配置中读取去重设置
+    dedup_config = config.get("deduplication", {})
+    if dedup_config:
+        from deduplication import LogDeduplicator
+        deduplicator = LogDeduplicator(
+            similarity_threshold=dedup_config.get("similarity_threshold", 0.92),
+            time_window_hours=dedup_config.get("time_window_hours", 2),
+            min_cluster_size=dedup_config.get("min_cluster_size", 2),
+            novelty_threshold=dedup_config.get("novelty_threshold", 0.05),
+            keep_latest_count=dedup_config.get("keep_latest_count", 3),
+            keep_anomalies=dedup_config.get("keep_anomalies", True)
+        )
+        log_processor.deduplicator = deduplicator
+
     logger.info("所有组件初始化完成")
 
 
@@ -289,6 +323,70 @@ def health_check():
         "timestamp": datetime.now().isoformat()
     }
 
+
+
+
+
+@app.get("/api/deduplication/stats")
+def get_deduplication_stats(components: Dict = Depends(get_components)):
+    """获取日志去重统计信息"""
+    deduplicator = components["log_processor"].deduplicator
+    return {
+        "status": "success",
+        "stats": deduplicator.get_stats()
+    }
+
+
+@app.post("/api/deduplication/config")
+def configure_deduplication(
+        request: DeduplicationConfigRequest,
+        components: Dict = Depends(get_components)
+):
+    """配置日志去重系统"""
+    deduplicator = components["log_processor"].deduplicator
+
+    # 更新配置参数
+    if request.similarity_threshold is not None:
+        deduplicator.similarity_threshold = request.similarity_threshold
+
+    if request.novelty_threshold is not None:
+        deduplicator.novelty_threshold = request.novelty_threshold
+
+    if request.time_window_hours is not None:
+        deduplicator.time_window_hours = request.time_window_hours
+
+    if request.min_cluster_size is not None:
+        deduplicator.min_cluster_size = request.min_cluster_size
+
+    if request.keep_latest_count is not None:
+        deduplicator.keep_latest_count = request.keep_latest_count
+
+    if request.keep_anomalies is not None:
+        deduplicator.keep_anomalies = request.keep_anomalies
+
+    return {
+        "status": "success",
+        "message": "去重配置已更新",
+        "current_config": {
+            "similarity_threshold": deduplicator.similarity_threshold,
+            "novelty_threshold": deduplicator.novelty_threshold,
+            "time_window_hours": deduplicator.time_window_hours,
+            "min_cluster_size": deduplicator.min_cluster_size,
+            "keep_latest_count": deduplicator.keep_latest_count,
+            "keep_anomalies": deduplicator.keep_anomalies
+        }
+    }
+
+
+@app.post("/api/deduplication/reset")
+def reset_deduplication_stats(components: Dict = Depends(get_components)):
+    """重置去重统计信息"""
+    deduplicator = components["log_processor"].deduplicator
+    deduplicator.reset_stats()
+    return {
+        "status": "success",
+        "message": "去重统计已重置"
+    }
 
 @app.post("/api/search")
 def search_logs(query: SearchQuery, components: Dict = Depends(get_components)):
@@ -404,13 +502,6 @@ def classify_query_endpoint(request: QueryClassificationRequest) -> QueryClassif
         system_prompt=system_prompt,
         user_prompt=user_prompt
     )
-
-
-class WeightUpdateRequest(BaseModel):
-    es_weight: Optional[float] = Field(None, ge=0.0, le=1.0, description="ES搜索权重")
-    vector_weight: Optional[float] = Field(None, ge=0.0, le=1.0, description="向量搜索权重")
-    weights_config: Optional[Union[Dict[str, Any], str]] = Field(None,
-                                                                 description="LLM分析的权重配置，可以是JSON字符串或字典")
 
 
 @app.post("/api/update_search_weights")

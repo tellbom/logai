@@ -663,19 +663,46 @@ class HybridSearch:
 
     def _calculate_context_score(self, results: List[Dict]) -> Dict[str, float]:
         """计算上下文相关性分数"""
-        # 提取时间戳并按时间排序
-        timestamps = [(i, result.get("timestamp")) for i, result in enumerate(results) if result.get("timestamp")]
-        timestamps.sort(key=lambda x: x[1])
+        from datetime import datetime
 
+        # 初始化每个结果的上下文分数为1.0
         context_scores = {result["id"]: 1.0 for result in results}
 
+        # 如果结果少于2条，无需计算上下文关系
+        if len(results) < 2:
+            return context_scores
+
+        # 提取时间戳并转换为datetime对象
+        valid_timestamps = []
+        for i, result in enumerate(results):
+            timestamp_str = result.get("timestamp")
+            if not timestamp_str:
+                continue
+
+            try:
+                # 尝试解析ISO格式的时间戳，处理带Z和不带Z的情况
+                if isinstance(timestamp_str, str):
+                    # 替换Z为+00:00以便于解析UTC时间
+                    timestamp_str = timestamp_str.replace("Z", "+00:00")
+                    timestamp = datetime.fromisoformat(timestamp_str)
+                    valid_timestamps.append((i, timestamp))
+            except (ValueError, TypeError):
+                # 如果解析失败，记录日志但继续处理其他时间戳
+                logger.warning(f"无法解析时间戳: {timestamp_str}")
+                continue
+
+        # 按时间排序
+        valid_timestamps.sort(key=lambda x: x[1])
+
         # 为时间接近的文档增加权重
-        for i in range(len(timestamps) - 1):
-            curr_idx, curr_time = timestamps[i]
-            next_idx, next_time = timestamps[i + 1]
+        for i in range(len(valid_timestamps) - 1):
+            curr_idx, curr_time = valid_timestamps[i]
+            next_idx, next_time = valid_timestamps[i + 1]
+
+            # 计算时间差（以秒为单位）
+            time_diff = (next_time - curr_time).total_seconds()
 
             # 如果两条日志时间接近(例如5分钟内)
-            time_diff = (next_time - curr_time).total_seconds()
             if time_diff < 300:  # 5分钟
                 boost = 1.0 - (time_diff / 300) * 0.2  # 时间越接近，提升越大
                 context_scores[results[curr_idx]["id"]] += boost

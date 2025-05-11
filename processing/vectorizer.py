@@ -10,6 +10,7 @@ from datetime import datetime
 from models.embedding import BaseEmbeddingModel
 from data.vector_store import QdrantVectorStore
 from config import get_config, get_model_config
+from deduplication import LogDeduplicator
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,9 @@ class LogVectorizer:
             content_column: str = "message",
             id_column: Optional[str] = None,
             metadata_columns: Optional[List[str]] = None,
-            service_name_column: str = "service_name"
+            service_name_column: str = "service_name",
+            deduplication: bool = True,  # 增加去重控制参数
+            deduplicator: Optional[LogDeduplicator] = None  # 可选传入去重器
     ) -> Tuple[int, int]:
         """
         处理DataFrame并向量化日志内容
@@ -67,6 +70,8 @@ class LogVectorizer:
             id_column: ID列名，如果为None则自动生成
             metadata_columns: 要包含在元数据中的列
             service_name_column: 服务名称列，用于区分不同系统
+            deduplication: 是否进行去重
+            deduplicator: 去重器实例
 
         Returns:
             (处理的记录数, 成功的记录数)
@@ -94,6 +99,38 @@ class LogVectorizer:
         # 处理DataFrame中的缺失值
         df = self._preprocess_dataframe(df, content_column)
 
+        # 确保数据有向量表示 - 添加这段代码
+        if 'vector' not in df.columns:
+            logger.info("在处理前添加向量表示")
+            try:
+                texts = df[content_column].fillna("").astype(str).tolist()
+                vectors = self.embedding_model.embed(texts)
+                df['vector'] = list(vectors)  # 添加向量列到DataFrame
+                logger.info(f"成功为 {len(df)} 条日志添加向量表示")
+            except Exception as e:
+                logger.error(f"添加向量表示时出错: {str(e)}")
+                # 创建一个空向量列以避免后续错误
+                df['vector'] = [[0.0] * self.embedding_model.get_dimension()] * len(df)
+
+        # 在向量化和存储之前进行增量去重
+        if deduplication:
+            try:
+                # 如果没有传入去重器，创建一个新的
+                if deduplicator is None:
+                    from deduplication import LogDeduplicator
+                    deduplicator = LogDeduplicator()
+
+                # 批量处理模式下，使用聚类去重
+                original_count = len(df)
+                df = deduplicator.smart_cluster_deduplication(df)
+                dedup_count = original_count - len(df)
+
+                if dedup_count > 0:
+                    logger.info(f"向量化前去重: 从{original_count}条日志中去除了{dedup_count}条重复日志")
+            except Exception as e:
+                logger.error(f"日志去重时出错: {str(e)}")
+                # 出错时继续处理，不进行去重
+
         # 分批处理
         total_records = len(df)
         successful_records = 0
@@ -101,6 +138,7 @@ class LogVectorizer:
         logger.info(f"开始处理 {total_records} 条日志记录")
         start_time = time.time()
 
+        # 批量处理
         for i in range(0, total_records, self.batch_size):
             batch_df = df.iloc[i:i + self.batch_size].copy()
 
@@ -158,8 +196,11 @@ class LogVectorizer:
                     metadata = self._extract_row_metadata(row, content_column, metadata_columns)
                     batch_payloads.append({"metadata": metadata})
 
-            # 生成嵌入向量
-            batch_vectors = self.embedding_model.embed(batch_texts)
+            # 使用现有向量或重新生成向量 (如果已经有向量，使用现有的)
+            if 'vector' in batch_df.columns and len(batch_texts) == len(batch_df):
+                batch_vectors = batch_df['vector'].tolist()
+            else:
+                batch_vectors = self.embedding_model.embed(batch_texts)
 
             # 将向量存储到Qdrant
             success = self.vector_store.add_vectors(
@@ -177,6 +218,7 @@ class LogVectorizer:
         logger.info(f"处理完成，成功处理 {successful_records}/{total_records} 条记录，耗时 {elapsed_time:.2f} 秒")
 
         return total_records, successful_records
+
 
     def _extract_row_metadata(
             self,
