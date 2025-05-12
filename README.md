@@ -32,14 +32,39 @@ max_logs：初始处理的最大日志数量（根据系统资源调整）
 
 在生产服务器上设置一个cron任务，定期执行增量处理：
 ```bash
-# 在crontab中添加（每10分钟执行一次）
-*/10 * * * * curl -X POST "http://your-server:8000/api/incremental_process" -H "Content-Type: application/json" -d '{"max_logs": 5000}'
-
-**参数说明：**
+  # 创建向量化服务
+  cat > /etc/systemd/system/log-vectorizer.service << EOF
+  [Unit]
+  Description=Vectorize processed logs
+  
+  [Service]
+  Type=oneshot
+  ExecStart=/bin/bash -c 'curl -X POST "http://localhost:8000/api/vectorize_logs" -H "Content-Type: application/json" -d \'{\"max_logs\": 5000}\''
+  
+  [Install]
+  WantedBy=multi-user.target
+  EOF
+  
+  # 创建向量化定时器
+  cat > /etc/systemd/system/log-vectorizer.timer << EOF
+  [Unit]
+  Description=Run log vectorizer every 10 minutes
+  
+  [Timer]
+  OnBootSec=10min
+  OnUnitActiveSec=10min
+  AccuracySec=1s
+  
+  [Install]
+  WantedBy=timers.target
+  EOF
+  
+  # 启用并启动timer
+  systemctl daemon-reload
+  systemctl enable log-vectorizer.timer
+  systemctl start log-vectorizer.timer
 
 ```
-
-max_logs：每次增量处理的最大日志数量，避免处理过多导致系统负载过高
 
 
 ## 第二阶段：配置Dify工作流
