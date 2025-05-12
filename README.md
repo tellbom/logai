@@ -19,14 +19,11 @@ curl -X POST "http://your-server:8000/api/process_and_vectorize" -H "Content-Typ
 }'
 
 **参数说明：**
-
-```
-
 source_index：ABP日志的源索引模式
 target_index：处理后存储的索引名称（推荐使用'logai-processed'，因为系统默认查询此索引）
 time_range_start/time_range_end：初始数据范围（建议处理近1-3个月的日志）
 max_logs：初始处理的最大日志数量（根据系统资源调整）
-
+```
 
 ### 步骤2：设置增量处理定时任务
 
@@ -266,22 +263,3 @@ json{
 
 按照上述步骤配置，您将拥有一个完整的、自动化的日志分析系统，能够处理C# ABP框架的日志数据，并利用AI提供智能分析和洞察。
 
-# 创建脚本文件
-cat > /root/process_logs_loop.sh << EOF
-#!/bin/bash
-while true; do
-  curl -X POST "http://localhost:8000/api/incremental_process" -H "Content-Type: application/json" -d '{"max_logs": 5000}'
-  echo "\$(date): Processed logs" >> /var/log/log_processor.log
-  sleep 600  # 10分钟 = 600秒
-done
-EOF
-
-# 添加执行权限
-chmod +x /root/process_logs_loop.sh
-
-# 使脚本在后台运行并持续运行
-nohup /root/process_logs_loop.sh > /dev/null 2>&1 &
-
-# 将启动命令添加到/etc/rc.local确保系统重启后自动启动
-echo "nohup /root/process_logs_loop.sh > /dev/null 2>&1 &" >> /etc/rc.local
-chmod +x /etc/rc.local
