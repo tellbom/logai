@@ -92,9 +92,15 @@ class LogVectorizer:
             elif service_name_column not in metadata_columns:
                 metadata_columns.append(service_name_column)
 
-        # 默认使用所有列作为元数据
+        # 确保关键元数据字段被包含
+        essential_fields = ["log_level", "@timestamp"]
         if metadata_columns is None:
             metadata_columns = [col for col in df.columns if col != content_column]
+        else:
+            # 添加必要的字段到元数据列表
+            for field in essential_fields:
+                if field in df.columns and field not in metadata_columns:
+                    metadata_columns.append(field)
 
         # 处理DataFrame中的缺失值
         df = self._preprocess_dataframe(df, content_column)
@@ -239,19 +245,30 @@ class LogVectorizer:
         """
         metadata = {"original_text": row[content_column]}
 
+        # 添加字段映射
+        field_mapping = {
+            "@timestamp": "timestamp"  # 将@timestamp映射为timestamp
+        }
+
         # 添加选定的元数据列
         for col in metadata_columns:
             if col in row:
                 value = row[col]
+
                 # 处理特殊类型
                 if isinstance(value, (datetime, pd.Timestamp)):
-                    metadata[col] = value.isoformat()
+                    processed_value = value.isoformat()
                 elif isinstance(value, (np.int64, np.float64)):
-                    metadata[col] = value.item()  # 将numpy类型转换为Python原生类型
+                    processed_value = value.item()  # 将numpy类型转换为Python原生类型
                 else:
-                    metadata[col] = value
+                    processed_value = value
+
+                # 使用映射的字段名称
+                key = field_mapping.get(col, col)
+                metadata[key] = processed_value
 
         return metadata
+
 
     def _chunk_texts(self, texts: List[str]) -> Tuple[List[str], Dict[int, int]]:
         """

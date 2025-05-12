@@ -19,49 +19,27 @@ curl -X POST "http://your-server:8000/api/process_and_vectorize" -H "Content-Typ
 }'
 
 **参数说明：**
+
+```
+
 source_index：ABP日志的源索引模式
 target_index：处理后存储的索引名称（推荐使用'logai-processed'，因为系统默认查询此索引）
 time_range_start/time_range_end：初始数据范围（建议处理近1-3个月的日志）
 max_logs：初始处理的最大日志数量（根据系统资源调整）
-```
+
 
 ### 步骤2：设置增量处理定时任务
 
 在生产服务器上设置一个cron任务，定期执行增量处理：
 ```bash
-  # 创建向量化服务
-  cat > /etc/systemd/system/log-vectorizer.service << EOF
-  [Unit]
-  Description=Vectorize processed logs
-  
-  [Service]
-  Type=oneshot
-  ExecStart=/bin/bash -c 'curl -X POST "http://localhost:8000/api/vectorize_logs" -H "Content-Type: application/json" -d \'{\"max_logs\": 5000}\''
-  
-  [Install]
-  WantedBy=multi-user.target
-  EOF
-  
-  # 创建向量化定时器
-  cat > /etc/systemd/system/log-vectorizer.timer << EOF
-  [Unit]
-  Description=Run log vectorizer every 10 minutes
-  
-  [Timer]
-  OnBootSec=10min
-  OnUnitActiveSec=10min
-  AccuracySec=1s
-  
-  [Install]
-  WantedBy=timers.target
-  EOF
-  
-  # 启用并启动timer
-  systemctl daemon-reload
-  systemctl enable log-vectorizer.timer
-  systemctl start log-vectorizer.timer
+# 在crontab中添加（每10分钟执行一次）
+*/10 * * * * curl -X POST "http://your-server:8000/api/incremental_process" -H "Content-Type: application/json" -d '{"max_logs": 5000}'
+
+**参数说明：**
 
 ```
+
+max_logs：每次增量处理的最大日志数量，避免处理过多导致系统负载过高
 
 
 ## 第二阶段：配置Dify工作流
@@ -262,4 +240,3 @@ json{
 
 
 按照上述步骤配置，您将拥有一个完整的、自动化的日志分析系统，能够处理C# ABP框架的日志数据，并利用AI提供智能分析和洞察。
-

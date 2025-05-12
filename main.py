@@ -245,7 +245,7 @@ def initialize_components():
 
     # 初始化异常检测器
     anomaly_detector = LogAnomalyDetector(
-        time_window=timedelta(hours=1),
+        time_window=timedelta(hours=24),
         sensitivity=0.95
     )
 
@@ -720,40 +720,6 @@ def analyze_patterns(request: AnalysisRequest, components: Dict = Depends(get_co
     return patterns
 
 
-@app.post("/api/incremental_process")
-def incremental_process(
-        background_tasks: BackgroundTasks,
-        components: Dict = Depends(get_components),
-        request: Optional[Dict[str, Any]] = None,
-):
-    """
-    启动增量处理
-    """
-    if request is None:
-        request = {}
-
-    # 获取配置
-    config = get_config()
-
-    # 使用请求参数或配置值
-    source_index = request.get("source_index", config.get("elasticsearch.index_pattern"))
-    target_index = request.get("target_index", config.get("target_elasticsearch.index"))
-
-    # 使用后台任务，避免长时间运行的请求
-    background_tasks.add_task(
-        components["log_processor"].process_incremental,
-        time_window=timedelta(hours=request.get("hours", 1)),
-        max_logs=request.get("max_logs", 10000),
-        save_to_file=request.get("save_to_file", True),
-        save_to_es=request.get("save_to_es", True),
-        source_index_pattern=source_index,
-        target_index=target_index
-    )
-
-    return {
-        "status": "success",
-        "message": f"增量处理任务已启动，源索引: {source_index}, 目标索引: {target_index}"
-    }
 
 @app.post("/api/update_prompt_template")
 def update_prompt_template(template: str = Body(..., embed=True), components: Dict = Depends(get_components)):
@@ -928,31 +894,59 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 
 @app.post("/api/process_and_vectorize")
-def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = Depends(get_components),request: Optional[Dict[str, Any]] = None):
-    """
-    处理并向量化日志数据
-    """
+def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = Depends(get_components),
+                          request: Optional[Dict[str, Any]] = None):
+    """处理并向量化日志数据"""
     if request is None:
         request = {}
 
-        # 获取配置
+    # 获取配置
     config = get_config()
 
     # 使用请求参数或配置值
     source_index = request.get("source_index", config.get("elasticsearch.index_pattern"))
     target_index = request.get("target_index", config.get("target_elasticsearch.index"))
 
-    # 使用后台任务，避免长时间运行的请求
+    # 使用自定义时间范围或默认24小时时间窗口
+    time_range_start = None
+    time_range_end = None
+    time_window = timedelta(hours=24)  # 默认24小时
+
+    if "time_range_start" in request and "time_range_end" in request:
+        # 如果提供了时间范围，则直接使用
+        try:
+            time_range_start = datetime.fromisoformat(request["time_range_start"].replace("Z", "+00:00"))
+            time_range_end = datetime.fromisoformat(request["time_range_end"].replace("Z", "+00:00"))
+            # 不使用time_window，因为会直接使用时间范围
+        except (ValueError, TypeError) as e:
+            logger.warning(f"解析时间范围失败: {e}, 使用默认时间窗口")
+    elif "time_window_hours" in request:
+        # 如果提供了时间窗口小时数
+        time_window = timedelta(hours=request.get("time_window_hours"))
+
+    # 使用后台任务
     def combined_task():
-        # 先处理日志
-        processed_df, summary = components["log_processor"].process_incremental(
-            time_window=timedelta(hours=1),
-            max_logs=10000,
-            save_to_file=True,
-            save_to_es=True,
-        source_index_pattern=source_index,
-        target_index=target_index
-        )
+        if time_range_start and time_range_end:
+            # 使用明确的时间范围
+            processed_df, summary = components["log_processor"].extract_and_process(
+                start_time=time_range_start,
+                end_time=time_range_end,
+                max_logs=10000,
+                save_to_file=True,
+                save_to_es=True,
+                target_index=target_index
+            )
+        else:
+            # 使用时间窗口
+            processed_df, summary = components["log_processor"].process_incremental(
+                time_window=time_window,
+                max_logs=10000,
+                save_to_file=True,
+                save_to_es=True,
+                source_index_pattern=source_index,
+                target_index=target_index
+            )
+
         # 再向量化
         if processed_df is not None and not processed_df.empty:
             components["log_vectorizer"].process_dataframe(processed_df)
@@ -961,8 +955,8 @@ def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = 
         components["log_processor"].save_last_timestamp()
 
     background_tasks.add_task(combined_task)
-
     return {"status": "success", "message": "增量处理和向量化任务已启动"}
+
 
 # 启动服务
 if __name__ == "__main__":
