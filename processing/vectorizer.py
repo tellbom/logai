@@ -21,10 +21,11 @@ class LogVectorizer:
     def __init__(
             self,
             embedding_model: BaseEmbeddingModel,
-            vector_store: QdrantVectorStore,
+            vector_store: QdrantVectorStore = None,  # 改为可选参数
             chunk_size: Optional[int] = None,
             batch_size: Optional[int] = None,
-            overlap: Optional[int] = None
+            overlap: Optional[int] = None,
+            field_mappings: Optional[Dict[str, str]] = None
     ):
         """
         初始化日志向量化处理器
@@ -35,10 +36,18 @@ class LogVectorizer:
             chunk_size: 文本块大小，用于长文本分块
             batch_size: 批处理大小
             overlap: 文本块重叠大小
+            field_mappings: 字段映射配置
         """
         # 加载配置
         self.config = get_config()
         self.model_config = get_model_config()
+
+        # 设置字段映射
+        self.field_mappings = field_mappings or {}
+        self.message_field = self.field_mappings.get("message_field", "message")
+        self.level_field = self.field_mappings.get("level_field", "log_level")
+        self.service_field = self.field_mappings.get("service_field", "service_name")
+        # timestamp_field 仍然使用 @timestamp
 
         # 设置参数，使用配置值作为默认值
         vectorization_config = self.model_config.get("vectorization", {})
@@ -54,10 +63,10 @@ class LogVectorizer:
     def process_dataframe(
             self,
             df: pd.DataFrame,
-            content_column: str = "message",
+            content_column: Optional[str] = None,
             id_column: Optional[str] = None,
             metadata_columns: Optional[List[str]] = None,
-            service_name_column: str = "service_name",
+            service_name_column: Optional[str] = None,
             deduplication: bool = True,  # 增加去重控制参数
             deduplicator: Optional[LogDeduplicator] = None  # 可选传入去重器
     ) -> Tuple[int, int]:
@@ -66,16 +75,20 @@ class LogVectorizer:
 
         Args:
             df: 包含日志数据的DataFrame
-            content_column: 内容列名
+            content_column: 内容列名(可选，如果为None则使用配置的message_field)
             id_column: ID列名，如果为None则自动生成
             metadata_columns: 要包含在元数据中的列
-            service_name_column: 服务名称列，用于区分不同系统
+            service_name_column: 服务名称列，用于区分不同系统(可选，如果为None则使用配置的service_field)
             deduplication: 是否进行去重
             deduplicator: 去重器实例
 
         Returns:
             (处理的记录数, 成功的记录数)
         """
+        # 使用配置的字段或提供的参数
+        content_column = content_column or self.message_field
+        service_name_column = service_name_column or self.service_field
+
         if df.empty:
             logger.warning("DataFrame为空，没有数据需要处理")
             return 0, 0
@@ -93,7 +106,7 @@ class LogVectorizer:
                 metadata_columns.append(service_name_column)
 
         # 确保关键元数据字段被包含
-        essential_fields = ["log_level", "@timestamp"]
+        essential_fields = [self.level_field, "@timestamp"]  # 仍使用@timestamp
         if metadata_columns is None:
             metadata_columns = [col for col in df.columns if col != content_column]
         else:
@@ -105,7 +118,7 @@ class LogVectorizer:
         # 处理DataFrame中的缺失值
         df = self._preprocess_dataframe(df, content_column)
 
-        # 确保数据有向量表示 - 添加这段代码
+        # 确保数据有向量表示
         if 'vector' not in df.columns:
             logger.info("在处理前添加向量表示")
             try:
@@ -209,13 +222,17 @@ class LogVectorizer:
                 batch_vectors = self.embedding_model.embed(batch_texts)
 
             # 将向量存储到Qdrant
-            success = self.vector_store.add_vectors(
-                ids=batch_ids,
-                vectors=batch_vectors,
-                payloads=batch_payloads
-            )
+            if self.vector_store:
+                success = self.vector_store.add_vectors(
+                    ids=batch_ids,
+                    vectors=batch_vectors,
+                    payloads=batch_payloads
+                )
 
-            if success:
+                if success:
+                    successful_records += len(batch_ids)
+            else:
+                # 如果没有向量存储，仅计数
                 successful_records += len(batch_ids)
 
             logger.info(f"已处理 {i + len(batch_df)}/{total_records} 条记录")
@@ -224,7 +241,6 @@ class LogVectorizer:
         logger.info(f"处理完成，成功处理 {successful_records}/{total_records} 条记录，耗时 {elapsed_time:.2f} 秒")
 
         return total_records, successful_records
-
 
     def _extract_row_metadata(
             self,
@@ -247,7 +263,9 @@ class LogVectorizer:
 
         # 添加字段映射
         field_mapping = {
-            "@timestamp": "timestamp"  # 将@timestamp映射为timestamp
+            "@timestamp": "timestamp",  # 将@timestamp映射为timestamp
+            self.level_field: "log_level",  # 将配置的level_field映射为log_level
+            self.service_field: "service_name"  # 将配置的service_field映射为service_name
         }
 
         # 添加选定的元数据列
@@ -269,6 +287,43 @@ class LogVectorizer:
 
         return metadata
 
+    def add_vectors_to_df(
+            self,
+            df: pd.DataFrame,
+            content_column: Optional[str] = None
+    ) -> pd.DataFrame:
+        """
+        为DataFrame添加向量表示
+
+        Args:
+            df: 日志DataFrame
+            content_column: 内容列名(可选，如果为None则使用配置的message_field)
+
+        Returns:
+            添加了向量的DataFrame
+        """
+        # 使用配置的字段或提供的参数
+        content_column = content_column or self.message_field
+
+        if df.empty:
+            return df
+
+        # 确保内容列存在
+        if content_column not in df.columns:
+            logger.error(f"内容列 '{content_column}' 不在DataFrame中")
+            return df
+
+        # 添加向量
+        try:
+            texts = df[content_column].fillna("").astype(str).tolist()
+            vectors = self.embedding_model.embed(texts)
+            df_with_vectors = df.copy()
+            df_with_vectors['vector'] = list(vectors)
+            logger.info(f"成功为 {len(df)} 条日志添加向量表示")
+            return df_with_vectors
+        except Exception as e:
+            logger.error(f"添加向量表示时出错: {str(e)}")
+            return df
 
     def _chunk_texts(self, texts: List[str]) -> Tuple[List[str], Dict[int, int]]:
         """
@@ -305,9 +360,9 @@ class LogVectorizer:
             df: pd.DataFrame,
             template_column: str = "template",
             cluster_id_column: str = "cluster_id",
-            sample_content_column: str = "message",
+            sample_content_column: Optional[str] = None,
             additional_metadata_columns: Optional[List[str]] = None,
-            service_name_column: str = "service_name"
+            service_name_column: Optional[str] = None
     ) -> Tuple[int, int]:
         """
         处理日志聚类结果并向量化模板
@@ -316,13 +371,17 @@ class LogVectorizer:
             df: 包含聚类结果的DataFrame
             template_column: 模板列名
             cluster_id_column: 聚类ID列名
-            sample_content_column: 样本内容列名
+            sample_content_column: 样本内容列名(可选，如果为None则使用配置的message_field)
             additional_metadata_columns: 额外的元数据列
-            service_name_column: 服务名称列
+            service_name_column: 服务名称列(可选，如果为None则使用配置的service_field)
 
         Returns:
             (处理的记录数, 成功的记录数)
         """
+        # 使用配置的字段或提供的参数
+        sample_content_column = sample_content_column or self.message_field
+        service_name_column = service_name_column or self.service_field
+
         if df.empty or template_column not in df.columns:
             logger.warning("聚类数据为空或缺少模板列")
             return 0, 0
@@ -342,7 +401,8 @@ class LogVectorizer:
             df=clusters_df,
             content_column=template_column,
             id_column=cluster_id_column,
-            metadata_columns=metadata_columns
+            metadata_columns=metadata_columns,
+            service_name_column=service_name_column
         )
 
     def process_error_stacks(
@@ -351,7 +411,7 @@ class LogVectorizer:
             error_stack_column: str = "stack_trace",
             id_column: Optional[str] = None,
             metadata_columns: Optional[List[str]] = None,
-            service_name_column: str = "service_name"
+            service_name_column: Optional[str] = None
     ) -> Tuple[int, int]:
         """
         处理错误堆栈跟踪信息并向量化
@@ -361,11 +421,14 @@ class LogVectorizer:
             error_stack_column: 错误堆栈列名
             id_column: ID列名
             metadata_columns: 元数据列
-            service_name_column: 服务名称列
+            service_name_column: 服务名称列(可选，如果为None则使用配置的service_field)
 
         Returns:
             (处理的记录数, 成功的记录数)
         """
+        # 使用配置的字段或提供的参数
+        service_name_column = service_name_column or self.service_field
+
         # 过滤有错误堆栈的记录
         error_df = df[df[error_stack_column].notna() & (df[error_stack_column] != "")]
 
@@ -384,7 +447,8 @@ class LogVectorizer:
             df=error_df,
             content_column=error_stack_column,
             id_column=id_column,
-            metadata_columns=metadata_columns
+            metadata_columns=metadata_columns,
+            service_name_column=service_name_column
         )
 
     def _preprocess_dataframe(self, df: pd.DataFrame, content_column: str) -> pd.DataFrame:
@@ -419,8 +483,8 @@ class LogVectorizer:
     def process_by_service(
             self,
             df: pd.DataFrame,
-            service_name_column: str = "service_name",
-            content_column: str = "message",
+            service_name_column: Optional[str] = None,
+            content_column: Optional[str] = None,
             id_column: Optional[str] = None,
             metadata_columns: Optional[List[str]] = None
     ) -> Dict[str, Tuple[int, int]]:
@@ -429,14 +493,18 @@ class LogVectorizer:
 
         Args:
             df: 包含日志数据的DataFrame
-            service_name_column: 服务名称列名
-            content_column: 内容列名
+            service_name_column: 服务名称列名(可选，如果为None则使用配置的service_field)
+            content_column: 内容列名(可选，如果为None则使用配置的message_field)
             id_column: ID列名
             metadata_columns: 元数据列
 
         Returns:
             服务名称到处理结果的映射
         """
+        # 使用配置的字段或提供的参数
+        service_name_column = service_name_column or self.service_field
+        content_column = content_column or self.message_field
+
         if df.empty:
             logger.warning("DataFrame为空，没有数据需要处理")
             return {}
@@ -448,7 +516,8 @@ class LogVectorizer:
                 df=df,
                 content_column=content_column,
                 id_column=id_column,
-                metadata_columns=metadata_columns
+                metadata_columns=metadata_columns,
+                service_name_column=service_name_column
             )
             return {"unknown_service": result}
 

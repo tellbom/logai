@@ -76,6 +76,12 @@ class DifyWorkflowQuery(BaseModel):
     time_range_start: Optional[datetime] = None
     time_range_end: Optional[datetime] = None
 
+    class Config:
+        json_encoders = {
+            datetime: lambda dt: dt.isoformat().replace("+00:00", "Z")
+            if dt.tzinfo is not None else dt.isoformat()
+        }
+
 
 class ProcessLogsRequest(BaseModel):
     start_time: Optional[datetime] = None
@@ -92,8 +98,8 @@ class VectorizeLogsRequest(BaseModel):
     end_time: Optional[datetime] = None
     max_logs: int = 10000
     query_filter: Optional[Dict[str, Any]] = None
-    content_column: str = "message"
-    service_name_column: str = "service_name"
+    content_column: Optional[str] = None  # 修改为可选
+    service_name_column: Optional[str] = None  # 修改为可选
 
 
 class AnalysisRequest(BaseModel):
@@ -154,6 +160,13 @@ def initialize_components():
     config = get_config()
     model_config = get_model_config()
 
+    # 添加这部分 - 获取字段映射配置
+    field_mappings = config.get("field_mappings", {})
+    timestamp_field = field_mappings.get("timestamp_field", "@timestamp")
+    message_field = field_mappings.get("message_field", "message")
+    level_field = field_mappings.get("level_field", "log_level")
+    service_field = field_mappings.get("service_field", "service_name")
+
     # 初始化日志
     log_level = config.get("app.log_level", "INFO")
     log_dir = config.get("app.log_dir", "./logs")
@@ -169,7 +182,8 @@ def initialize_components():
         es_password=es_config.get("password"),
         es_index_pattern=es_config.get("index_pattern", "logstash-*"),
         use_ssl=es_config.get("use_ssl", False),
-        verify_certs=es_config.get("verify_certs", False)
+        verify_certs=es_config.get("verify_certs", False),
+        timestamp_field=timestamp_field  # 添加这一行
     )
 
     # 初始化目标ES连接器（带IK分词器）
@@ -181,7 +195,8 @@ def initialize_components():
         es_password=target_es_config.get("password"),
         es_index_pattern=target_es_config.get("index", "logai-processed"),  # 注意这里使用index而非index_pattern
         use_ssl=target_es_config.get("use_ssl", False),
-        verify_certs=target_es_config.get("verify_certs", False)
+        verify_certs=target_es_config.get("verify_certs", False),
+        timestamp_field=timestamp_field  # 添加这一行
     )
 
     # 初始化嵌入模型
@@ -214,13 +229,25 @@ def initialize_components():
     log_processor = LogProcessor(
         es_connector=es_connector,
         target_es_connector=target_es_connector,  # 需要修改LogProcessor类接受这个参数
-        output_dir=config.get("app.output_dir", "./output")
+        output_dir=config.get("app.output_dir", "./output"),
+        field_mappings={  # 添加这个字典
+            "timestamp_field": timestamp_field,
+            "message_field": message_field,
+            "level_field": level_field,
+            "service_field": service_field
+        }
     )
 
     # 初始化日志向量化处理器
     log_vectorizer = LogVectorizer(
         embedding_model=embedding_model,
-        vector_store=vector_store
+        vector_store=vector_store,
+        field_mappings={  # 添加这个字典
+            "timestamp_field": timestamp_field,
+            "message_field": message_field,
+            "level_field": level_field,
+            "service_field": service_field
+        }
     )
 
     # 初始化混合搜索
@@ -233,7 +260,13 @@ def initialize_components():
         es_weight=hybrid_search_config.get("es_weight", 0.3),
         vector_weight=hybrid_search_config.get("vector_weight", 0.7),
         final_results_limit=hybrid_search_config.get("top_k", 20),
-        rerank_url = hybrid_search_config.get("rerank_url","http://localhost:8091/rerank")  # 您的重排序服务URL
+        rerank_url = hybrid_search_config.get("rerank_url","http://localhost:8091/rerank"),  # 您的重排序服务URL
+        field_mappings={  # 添加这个字典
+            "timestamp_field": timestamp_field,
+            "message_field": message_field,
+            "level_field": level_field,
+            "service_field": service_field
+        }
     )
 
     # 初始化查询处理器
@@ -255,12 +288,6 @@ def initialize_components():
         min_confidence=0.6
     )
 
-    # 初始化日志处理器时传入去重配置
-    log_processor = LogProcessor(
-        es_connector=es_connector,
-        target_es_connector=target_es_connector,
-        output_dir=config.get("app.output_dir", "./output")
-    )
 
     # 从配置中读取去重设置
     dedup_config = config.get("deduplication", {})
@@ -637,9 +664,15 @@ def process_logs(request: ProcessLogsRequest, components: Dict = Depends(get_com
 
 @app.post("/api/vectorize_logs")
 def vectorize_logs(request: VectorizeLogsRequest, components: Dict = Depends(get_components)):
-    """
-    向量化日志数据
-    """
+    """向量化日志数据"""
+    # 获取配置
+    config = get_config()
+    field_mappings = config.get("field_mappings", {})
+
+    # 使用请求中指定的字段名，如果没有则使用配置中的值
+    content_column = request.content_column or field_mappings.get("message_field", "message")
+    service_name_column = request.service_name_column or field_mappings.get("service_field", "service_name")
+
     # 首先提取并处理日志
     processed_df, _ = components["log_processor"].extract_and_process(
         start_time=request.start_time,
@@ -656,8 +689,8 @@ def vectorize_logs(request: VectorizeLogsRequest, components: Dict = Depends(get
     # 向量化处理后的数据
     total, successful = components["log_vectorizer"].process_dataframe(
         df=processed_df,
-        content_column=request.content_column,
-        service_name_column=request.service_name_column
+        content_column=content_column,
+        service_name_column=service_name_column
     )
 
     return {
@@ -750,6 +783,8 @@ def get_services(components: Dict = Depends(get_components)):
     """
     获取可用的服务列表
     """
+    config = get_config()
+    field_mappings = config.get("field_mappings", {})
     try:
         # 查询ES中的服务名称
         query = {
@@ -757,7 +792,7 @@ def get_services(components: Dict = Depends(get_components)):
             "aggs": {
                 "services": {
                     "terms": {
-                        "field": "service_name",
+                        "field":  field_mappings.get("service_field", "service_name"),
                         "size": 100
                     }
                 }
@@ -786,6 +821,9 @@ def get_log_levels(components: Dict = Depends(get_components)):
     """
     获取可用的日志级别列表
     """
+    # 获取配置
+    config = get_config()
+    field_mappings = config.get("field_mappings", {})
     try:
         # 查询ES中的日志级别
         query = {
@@ -793,7 +831,7 @@ def get_log_levels(components: Dict = Depends(get_components)):
             "aggs": {
                 "log_levels": {
                     "terms": {
-                        "field": "log_level",
+                        "field": field_mappings.get("level_field", "log_level"),
                         "size": 20
                     }
                 }
@@ -822,6 +860,9 @@ def get_stats(components: Dict = Depends(get_components)):
     """
     获取系统统计信息
     """
+    # 获取配置
+    config = get_config()
+    field_mappings = config.get("field_mappings", {})
     try:
         # 获取日志总数
         total_query = {
@@ -840,7 +881,7 @@ def get_stats(components: Dict = Depends(get_components)):
         error_query = {
             "query": {
                 "terms": {
-                    "log_level": ["ERROR", "FATAL"]
+                    field_mappings.get("level_field", "log_level"): ["ERROR", "FATAL"]
                 }
             },
             "size": 0
@@ -903,6 +944,10 @@ def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = 
     # 获取配置
     config = get_config()
 
+    # 获取字段映射配置
+    field_mappings = config.get("field_mappings", {})
+    message_field = field_mappings.get("message_field", "message")
+
     # 使用请求参数或配置值
     source_index = request.get("source_index", config.get("elasticsearch.index_pattern"))
     target_index = request.get("target_index", config.get("target_elasticsearch.index"))
@@ -949,7 +994,10 @@ def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = 
 
         # 再向量化
         if processed_df is not None and not processed_df.empty:
-            components["log_vectorizer"].process_dataframe(processed_df)
+            components["log_vectorizer"].process_dataframe(
+                processed_df,
+                content_column=message_field
+            )
 
         # 保存时间戳
         components["log_processor"].save_last_timestamp()

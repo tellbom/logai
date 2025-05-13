@@ -31,7 +31,8 @@ class QueryProcessor:
             prompt_template: Optional[str] = None,
             max_context_logs: int = 5,
             token_limit: int = 4000,
-            min_confidence: float = 0.6
+            min_confidence: float = 0.6,
+            field_mappings: Optional[Dict[str, str]] = None
     ):
         """
         初始化查询处理器
@@ -42,34 +43,43 @@ class QueryProcessor:
             max_context_logs: 最大上下文日志数量
             token_limit: 令牌限制
             min_confidence: 最小置信度
+            field_mappings: 字段映射配置
         """
         self.hybrid_search = hybrid_search
         self.max_context_logs = max_context_logs
         self.token_limit = token_limit
         self.min_confidence = min_confidence
 
+        # 设置字段映射
+        self.field_mappings = field_mappings or {}
+        self.message_field = self.field_mappings.get("message_field", "message")
+        self.level_field = self.field_mappings.get("level_field", "log_level")
+        self.service_field = self.field_mappings.get("service_field", "service_name")
+        # timestamp_field 保持默认 "@timestamp"
+
         # 默认提示词模板
         self.default_prompt_template = """
-你是一个专业的日志分析助手，负责帮助用户分析和理解系统日志。
-请基于下面提供的日志信息回答用户的问题。如果日志中没有相关信息，请直接说明无法从提供的日志中找到答案。
+    你是一个专业的日志分析助手，负责帮助用户分析和理解系统日志。
+    请基于下面提供的日志信息回答用户的问题。如果日志中没有相关信息，请直接说明无法从提供的日志中找到答案。
 
-### 相关日志信息:
-{context}
+    ### 相关日志信息:
+    {context}
 
-### 用户问题:
-{query}
+    ### 用户问题:
+    {query}
 
-请分析这些日志并回答用户的问题。你的回答应该:
-1. 简洁明了，直接针对问题给出答案
-2. 必要时引用具体的日志内容作为依据
-3. 如果是错误分析，尽可能提供错误原因和可能的解决方案
-4. 如果日志信息不足以回答问题，请明确指出，不要猜测或编造信息
-"""
+    请分析这些日志并回答用户的问题。你的回答应该:
+    1. 简洁明了，直接针对问题给出答案
+    2. 必要时引用具体的日志内容作为依据
+    3. 如果是错误分析，尽可能提供错误原因和可能的解决方案
+    4. 如果日志信息不足以回答问题，请明确指出，不要猜测或编造信息
+    """
 
         # 使用自定义模板或默认模板
         self.prompt_template = prompt_template or self.default_prompt_template
 
         logger.info("查询处理器初始化完成")
+
 
     def process_query(
             self,

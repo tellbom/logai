@@ -44,7 +44,8 @@ class HybridSearch:
             max_es_results: int = 50,
             max_vector_results: int = 50,
             rerank_results: int = 30,
-            final_results_limit: int = 20
+            final_results_limit: int = 20,
+            field_mappings: Optional[Dict[str, str]] = None
     ):
         """
         初始化混合搜索
@@ -62,6 +63,7 @@ class HybridSearch:
             max_vector_results: 向量搜索最大结果数
             rerank_results: 重排序的最大结果数
             final_results_limit: 最终返回结果数量限制
+            field_mappings: 字段映射配置
         """
         self.es_connector = es_connector
         self.vector_store = vector_store
@@ -78,7 +80,20 @@ class HybridSearch:
         self.rerank_results = rerank_results
         self.final_results_limit = final_results_limit
 
+        # 设置字段映射
+        self.field_mappings = field_mappings or {}
+        self.message_field = self.field_mappings.get("message_field", "message")
+        self.level_field = self.field_mappings.get("level_field", "log_level")
+        self.service_field = self.field_mappings.get("service_field", "service_name")
+        # timestamp_field 保持默认"@timestamp"
+
+        logger.info(f"HybridSearch接收到的字段映射: {self.field_mappings}")
+
+        # 打印最终应用的字段名
+        logger.info(
+            f"实际使用的字段名: message_field={self.message_field}, level_field={self.level_field}, service_field={self.service_field}")
         logger.info(f"混合搜索初始化，ES权重: {es_weight}, 向量权重: {vector_weight}, 重排序权重: {rerank_weight}")
+
 
     def set_weights(self, es_weight: float, vector_weight: float):
         """设置混合搜索的权重参数
@@ -136,6 +151,9 @@ class HybridSearch:
 
         # 准备过滤条件
         es_filters = self._prepare_es_filters(filters, time_range, services, log_levels)
+        logger.info(f"搜索参数: 查询='{query}', 时间范围={time_range}, 服务={services}, 日志级别={log_levels}")
+        logger.info(f"ES过滤条件: {json.dumps(es_filters, default=str)}")  # 使用default=str处理不可序列化对象
+
         vector_filters = self._prepare_vector_filters(filters, time_range, services, log_levels)
 
         # 执行向量搜索
@@ -145,6 +163,7 @@ class HybridSearch:
 
         # 执行ES搜索
         es_results = self._search_es(query, es_filters, search_processed_index)
+        logger.info(f"ES搜索结果数量: {len(es_results)}")
 
         # 合并初步结果以准备重排序
         initial_results = self._merge_initial_results(es_results, vector_results)
@@ -344,62 +363,45 @@ class HybridSearch:
     ) -> List[Dict[str, Any]]:
         """
         准备ES过滤条件
-
-        Args:
-            filters: 自定义过滤条件
-            time_range: 时间范围
-            services: 服务列表
-            log_levels: 日志级别列表
-
-        Returns:
-            ES过滤条件列表
         """
-        es_filters = []
+        es_filters = []  # 初始化为空列表，不是None
 
         # 时间范围过滤
         if time_range:
             start_time, end_time = time_range
+
+            # 确保两个时间都是UTC时间并保留Z后缀
+            start_iso = start_time.isoformat()
+            end_iso = end_time.isoformat()
+
+            # 如果时间字符串包含+00:00，替换为Z
+            if '+00:00' in start_iso:
+                start_iso = start_iso.replace('+00:00', 'Z')
+            elif not start_iso.endswith('Z') and start_time.tzinfo is not None:
+                start_iso += 'Z'
+
+            if '+00:00' in end_iso:
+                end_iso = end_iso.replace('+00:00', 'Z')
+            elif not end_iso.endswith('Z') and end_time.tzinfo is not None:
+                end_iso += 'Z'
+
+            logger.info(f"准备ES时间查询: 开始={start_iso}, 结束={end_iso}")
+
             time_filter = {
                 "range": {
                     "@timestamp": {
-                        "gte": start_time.isoformat(),
-                        "lte": end_time.isoformat()
+                        "gte": start_iso,
+                        "lte": end_iso
                     }
                 }
             }
             es_filters.append(time_filter)
 
-        # 服务过滤
-        if services:
-            service_filter = {
-                "terms": {
-                    "service_name": services
-                }
-            }
-            es_filters.append(service_filter)
+        # 添加调试日志，确认过滤条件
+        logger.info(f"准备的ES过滤条件: {json.dumps(es_filters, default=str)}")
 
-        # 日志级别过滤
-        if log_levels:
-            level_filter = {
-                "terms": {
-                    "log_level": log_levels
-                }
-            }
-            es_filters.append(level_filter)
+        return es_filters  # 确保返回过滤条件列表
 
-        # 添加自定义过滤条件
-        if filters:
-            for field, value in filters.items():
-                if isinstance(value, list):
-                    filter_item = {"terms": {field: value}}
-                elif isinstance(value, dict) and ("gte" in value or "lte" in value):
-                    filter_item = {"range": {field: value}}
-                else:
-                    filter_item = {"term": {field: value}}
-
-                es_filters.append(filter_item)
-
-        return es_filters
 
     def _prepare_vector_filters(
             self,
@@ -422,7 +424,7 @@ class HybridSearch:
         """
         vector_filters = {}
 
-        # 时间范围过滤
+        # 时间范围过滤 - 使用 timestamp 而非 @timestamp，因为向量存储中字段名不同
         if time_range:
             start_time, end_time = time_range
             vector_filters["metadata.timestamp"] = {
@@ -453,6 +455,7 @@ class HybridSearch:
                     vector_filters[vector_key] = value
 
         return vector_filters
+
 
     def _search_vectors(
             self,
@@ -532,6 +535,8 @@ class HybridSearch:
         Returns:
             ES搜索结果列表
         """
+        logger.info(
+            f"ES搜索使用字段: message_field={self.message_field}, level_field={self.level_field}, service_field={self.service_field}")
         try:
             # 构建ES查询
             es_query = {
@@ -539,10 +544,10 @@ class HybridSearch:
                     "must": [
                         {
                             "match": {
-                                "message": {
+                                self.message_field: {
                                     "query": query,
-                                     "operator": "or",
-                                     "minimum_should_match": "30%"
+                                    "operator": "or",
+                                    "minimum_should_match": "30%"
                                 }
                             }
                         }
@@ -551,11 +556,23 @@ class HybridSearch:
             }
 
             # 添加过滤条件
-            if filters:
+            if filters and len(filters) > 0:  # 确认filters存在且不为空:
                 es_query["bool"]["filter"] = filters
+                logger.info(f"应用过滤条件到查询: {json.dumps(filters, default=str)}")
 
             # 确定搜索索引
             index_pattern = "logai-processed" if search_processed_index else self.es_connector.es_index_pattern
+
+            # 记录完整ES查询
+            full_query = {
+                "query": es_query,
+                "size": self.max_es_results,
+                "sort": [
+                    {"_score": {"order": "desc"}},
+                    {"@timestamp": {"order": "desc"}}
+                ]
+            }
+            logger.info(f"完整ES查询: {json.dumps(full_query, ensure_ascii=False)}")
 
             # 执行搜索
             search_results = self.es_connector.es_client.search(
@@ -580,13 +597,13 @@ class HybridSearch:
                     "id": hit["_id"],
                     "score": float(hit["_score"]),
                     "source": "elasticsearch",
-                    "log_level": source.get("log_level", ""),
+                    "log_level": source.get(self.level_field, ""),
                     "timestamp": source.get("@timestamp", ""),
-                    "message": source.get("message", ""),
-                    "service_name": source.get("service_name", ""),
+                    "message": source.get(self.message_field, ""),
+                    "service_name": source.get(self.service_field, ""),
                     "template": source.get("template", ""),
                     "cluster_id": source.get("cluster_id", ""),
-                    "metadata": {k: v for k, v in source.items() if k not in ["message", "@timestamp"]}
+                    "metadata": {k: v for k, v in source.items() if k not in [self.message_field, "@timestamp"]}
                 }
 
                 processed_results.append(processed_result)

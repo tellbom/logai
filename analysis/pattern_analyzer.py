@@ -34,7 +34,8 @@ class LogPatternAnalyzer:
             time_window: timedelta = timedelta(minutes=5),
             min_confidence: float = 0.6,
             min_support: int = 3,
-            max_patterns: int = 20
+            max_patterns: int = 20,
+            field_mappings: Optional[Dict[str, str]] = None
     ):
         """
         初始化模式分析器
@@ -44,6 +45,7 @@ class LogPatternAnalyzer:
             min_confidence: 最小置信度，用于关联规则
             min_support: 最小支持度，模式必须出现的最小次数
             max_patterns: 返回的最大模式数量
+            field_mappings: 字段映射配置
         """
         self.config = get_config()
         self.time_window = time_window
@@ -51,35 +53,48 @@ class LogPatternAnalyzer:
         self.min_support = min_support
         self.max_patterns = max_patterns
 
+        # 设置字段映射
+        self.field_mappings = field_mappings or {}
+        self.message_field = self.field_mappings.get("message_field", "message")
+        self.level_field = self.field_mappings.get("level_field", "log_level")
+        self.service_field = self.field_mappings.get("service_field", "service_name")
+        self.timestamp_field = self.field_mappings.get("timestamp_field", "@timestamp")
+
         logger.info(f"日志模式分析器初始化，时间窗口: {time_window}, 最小置信度: {min_confidence}")
 
     def analyze_patterns(
             self,
             df: pd.DataFrame,
-            timestamp_col: str = '@timestamp',
-            message_col: str = 'message',
-            level_col: str = 'log_level',
+            timestamp_col: str = None,
+            message_col: str = None,
+            level_col: str = None,
             error_levels: List[str] = ['ERROR', 'FATAL'],
             template_col: Optional[str] = 'template',
             cluster_id_col: Optional[str] = 'cluster_id',
-            service_name_col: Optional[str] = 'service_name'
+            service_name_col: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         分析日志数据中的模式
 
         Args:
             df: 日志DataFrame
-            timestamp_col: 时间戳列名
-            message_col: 消息列名
-            level_col: 日志级别列名
+            timestamp_col: 时间戳列名（如果为None则使用配置的timestamp_field）
+            message_col: 消息列名（如果为None则使用配置的message_field）
+            level_col: 日志级别列名（如果为None则使用配置的level_field）
             error_levels: 错误级别列表
             template_col: 模板列名（可选）
             cluster_id_col: 聚类ID列名（可选）
-            service_name_col: 服务名称列名（可选）
+            service_name_col: 服务名称列名（如果为None则使用配置的service_field）
 
         Returns:
             模式分析结果字典
         """
+        # 使用配置的字段名或提供的参数
+        timestamp_col = timestamp_col or self.timestamp_field
+        message_col = message_col or self.message_field
+        level_col = level_col or self.level_field
+        service_name_col = service_name_col or self.service_field
+
         if df.empty:
             logger.warning("DataFrame为空，无法进行模式分析")
             return {"status": "no_data", "patterns": []}
@@ -151,6 +166,7 @@ class LogPatternAnalyzer:
             "total_patterns": total_patterns,
             **results
         }
+
 
     def _analyze_patterns_by_service(
             self,

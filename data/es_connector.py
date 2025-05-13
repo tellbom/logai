@@ -20,7 +20,8 @@ class ESConnector:
             es_password: Optional[str] = None,
             es_index_pattern: str = "logstash-*",
             use_ssl: bool = False,
-            verify_certs: bool = False
+            verify_certs: bool = False,
+            timestamp_field: str = "@timestamp"  # 新增参数，默认仍为"@timestamp"
     ):
         """
         初始化ES连接器
@@ -33,6 +34,7 @@ class ESConnector:
             es_index_pattern: 要查询的索引模式
             use_ssl: 是否使用SSL连接
             verify_certs: 是否验证SSL证书
+            timestamp_field: 时间戳字段名
         """
         # 初始化ES客户端
         self.es_config = {
@@ -47,6 +49,7 @@ class ESConnector:
 
         self.es_client = Elasticsearch([self.es_config])
         self.es_index_pattern = es_index_pattern
+        self.timestamp_field = timestamp_field  # 保存时间戳字段名
 
         # 检查ES连接
         if not self.es_client.ping():
@@ -65,7 +68,7 @@ class ESConnector:
             max_logs: int = 100000,
             query_filter: Optional[Dict] = None,
             fields: Optional[List[str]] = None,
-            sort_field: str = "@timestamp"
+            sort_field: Optional[str] = None
     ) -> pd.DataFrame:
         """
         从ES中提取日志数据
@@ -81,6 +84,10 @@ class ESConnector:
         Returns:
             包含日志数据的DataFrame
         """
+        # 使用配置的时间戳字段或默认值
+        timestamp_field = self.timestamp_field
+        sort_field = sort_field or timestamp_field
+
         # 构建查询
         query = {"match_all": {}}
 
@@ -95,7 +102,7 @@ class ESConnector:
                 if end_time:
                     time_range["lte"] = end_time.isoformat()
 
-                query["bool"]["must"].append({"range": {"@timestamp": time_range}})
+                query["bool"]["must"].append({"range": {timestamp_field: time_range}})
 
             # 添加其他过滤条件
             if query_filter:
@@ -174,19 +181,21 @@ class ESConnector:
         # 转换为DataFrame
         df = pd.DataFrame(results)
 
-        if not df.empty and "@timestamp" in df.columns:
+        if not df.empty and timestamp_field in df.columns:
             # 更新最后处理的时间戳
-            self.last_processed_timestamp = df["@timestamp"].max()
+            self.last_processed_timestamp = df[timestamp_field].max()
 
         logger.info(f"成功从ES提取 {len(df)} 条日志记录")
         return df
 
+    # 在data/es_connector.py中
     def save_to_new_index(
             self,
             df: pd.DataFrame,
             target_index: str,
             id_column: str = "_id",
-            batch_size: int = 1000
+            batch_size: int = 1000,
+            field_mappings: Optional[Dict[str, str]] = None  # 添加字段映射参数
     ) -> Tuple[int, int]:
         """
         将DataFrame数据保存到新的ES索引
@@ -194,6 +203,14 @@ class ESConnector:
         if df.empty:
             logger.warning("没有数据需要保存到ES")
             return 0, 0
+
+        # 应用字段映射（如果提供）
+        field_map = {}
+        if field_mappings:
+            # 反向映射 - 源字段到目标字段
+            for target_field, source_field in field_mappings.items():
+                if source_field in df.columns:
+                    field_map[source_field] = target_field
 
         # 检查目标索引是否存在，如果不存在则创建
         if not self.es_client.indices.exists(index=target_index):
@@ -225,18 +242,21 @@ class ESConnector:
                         # 跳过所有元数据字段
                         continue
 
+                    # 应用字段映射
+                    target_col = field_map.get(col, col)  # 如果没有映射，保持原样
+
                     # 处理其他字段的数据类型
                     if pd.isna(val):
-                        doc[col] = None
+                        doc[target_col] = None
                     elif isinstance(val, (pd.Timestamp, datetime.datetime)):
-                        doc[col] = val.isoformat()
+                        doc[target_col] = val.isoformat()
                     else:
                         # 尝试安全转换
                         try:
-                            json.dumps({col: val})  # 测试JSON兼容性
-                            doc[col] = val
+                            json.dumps({target_col: val})  # 测试JSON兼容性
+                            doc[target_col] = val
                         except (TypeError, OverflowError):
-                            doc[col] = str(val)
+                            doc[target_col] = str(val)
 
                 # 创建操作
                 action = {

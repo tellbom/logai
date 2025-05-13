@@ -31,19 +31,29 @@ class LogProcessor:
             es_connector: ESConnector,
             target_es_connector: ESConnector,
             output_dir: str = "./output",
-            create_output_dir: bool = True
+            create_output_dir: bool = True,
+            field_mappings: Optional[Dict[str, str]] = None
     ):
         """
         初始化日志处理器
 
         Args:
             es_connector: ES连接器
+            target_es_connector: 目标ES连接器
             output_dir: 输出目录
             create_output_dir: 是否创建输出目录
+            field_mappings: 字段映射配置
         """
         self.es_connector = es_connector
         self.target_es_connector = target_es_connector
         self.output_dir = output_dir
+
+        # 设置字段映射
+        self.field_mappings = field_mappings or {}
+        self.message_field = self.field_mappings.get("message_field", "message")
+        self.level_field = self.field_mappings.get("level_field", "log_level")
+        self.service_field = self.field_mappings.get("service_field", "service_name")
+        # 注意：timestamp_field 仍然使用 @timestamp
 
         # 创建输出目录
         if create_output_dir and not os.path.exists(output_dir):
@@ -96,7 +106,7 @@ class LogProcessor:
     def parse_logs(
             self,
             logs_df: pd.DataFrame,
-            content_column: str = "message",
+            content_column: str = None,
             timestamp_column: str = "@timestamp",
             id_column: str = "_id",
             algorithm: str = "drain",
@@ -107,7 +117,7 @@ class LogProcessor:
 
         Args:
             logs_df: 包含日志数据的DataFrame
-            content_column: 内容列名
+            content_column: 内容列名（如果为None则使用配置的message_field）
             timestamp_column: 时间戳列名
             id_column: ID列名
             algorithm: 解析算法，默认为'drain'
@@ -116,6 +126,9 @@ class LogProcessor:
         Returns:
             解析后的DataFrame和解析结果
         """
+        # 使用配置的字段名或默认值
+        content_column = content_column or self.message_field
+
         if logs_df.empty:
             logger.warning("没有日志数据需要解析")
             return logs_df, {"status": "no_data"}
@@ -575,6 +588,7 @@ class LogProcessor:
             save_to_es: 是否保存结果到ES
             target_index: 目标ES索引名称
             preprocess: 是否进行预处理
+            deduplication: 是否进行去重
 
         Returns:
             处理后的DataFrame和处理结果信息
@@ -605,12 +619,15 @@ class LogProcessor:
         if preprocess:
             # 导入预处理器
             from processing.preprocessor import LogPreprocessor
-            preprocessor = LogPreprocessor()
 
-            logs_df = preprocessor.preprocess(logs_df)
+            # 使用和LogProcessor相同的字段映射
+            preprocessor = LogPreprocessor(field_mappings=self.field_mappings)
+
+            # 使用配置的字段名
+            logs_df = preprocessor.preprocess(logs_df, message_column=self.message_field)
 
             # 使用更通用的异常处理
-            logs_df = preprocessor.normalize_exceptions(logs_df)
+            logs_df = preprocessor.normalize_exceptions(logs_df, message_column=self.message_field)
             logger.info("执行了异常日志标准化")
 
         # 如果启用去重，在解析日志前进行智能聚类去重
@@ -622,7 +639,8 @@ class LogProcessor:
                 # 调用嵌入模型获取向量
                 from processing.vectorizer import LogVectorizer
                 vectorizer = LogVectorizer(self.embedding_model)
-                logs_df = vectorizer.add_vectors_to_df(logs_df, content_column='message')
+                # 使用配置的消息字段而非硬编码的 'message'
+                logs_df = vectorizer.add_vectors_to_df(logs_df, content_column=self.message_field)
 
             # 应用智能聚类去重
             if 'vector' in logs_df.columns:
@@ -632,21 +650,24 @@ class LogProcessor:
             else:
                 logger.warning("日志数据缺少向量表示，无法执行智能去重")
 
-        # 解析日志
-        parsed_df, parsing_summary = self.parse_logs(logs_df)
+        # 解析日志 - 使用配置的消息字段
+        parsed_df, parsing_summary = self.parse_logs(logs_df, content_column=self.message_field)
 
         # 检测异常
-        anomaly_df, anomaly_summary = self.detect_anomalies(parsed_df)
+        anomaly_df, anomaly_summary = self.detect_anomalies(parsed_df, template_column="template")
 
         # 聚类分析
-        clustered_df, clustering_summary = self.cluster_logs(anomaly_df)
+        clustered_df, clustering_summary = self.cluster_logs(anomaly_df, feature_column="template")
 
-        # 提取错误模式
-        error_patterns = self.extract_error_patterns(clustered_df)
+        # 提取错误模式 - 使用配置的级别字段
+        error_patterns = self.extract_error_patterns(
+            clustered_df,
+            log_level_column=self.level_field,
+            message_column=self.message_field
+        )
 
         end_process_time = datetime.datetime.now()
         process_duration = (end_process_time - start_process_time).total_seconds()
-
 
         # 更新最后处理的时间戳
         if not clustered_df.empty and "@timestamp" in clustered_df.columns:
@@ -683,10 +704,22 @@ class LogProcessor:
             # 如果未指定目标索引，使用默认值
             if target_index is None:
                 target_index = "logai-processed"
+            # 创建反向字段映射
+            reverse_field_mappings = None
+            if self.field_mappings:
+                reverse_field_mappings = {
+                    # 以配置的字段为目标字段
+                    "message": self.field_mappings.get("message_field", "message"),
+                    "log_level": self.field_mappings.get("level_field", "log_level"),
+                    "service_name": self.field_mappings.get("service_field", "service_name"),
+                    # 时间戳字段通常保持不变
+                    "@timestamp": "@timestamp"
+                }
 
             total, success = self.target_es_connector.save_to_new_index(
                 clustered_df,
-                target_index=target_index
+                target_index=target_index,
+                field_mappings=reverse_field_mappings  # 传递字段映射
             )
             processing_summary["es_export"] = {
                 "total": total,
@@ -699,9 +732,9 @@ class LogProcessor:
     def extract_error_patterns(
             self,
             df: pd.DataFrame,
-            log_level_column: str = "log_level",
+            log_level_column: str = None,
             error_levels: List[str] = ["ERROR", "FATAL"],
-            message_column: str = "message",
+            message_column: str = None,
             stack_trace_column: Optional[str] = "stack_trace"
     ) -> Dict[str, Any]:
         """
@@ -709,14 +742,18 @@ class LogProcessor:
 
         Args:
             df: 日志DataFrame
-            log_level_column: 日志级别列名
+            log_level_column: 日志级别列名（如果为None则使用配置的level_field）
             error_levels: 错误级别列表
-            message_column: 消息列名
+            message_column: 消息列名（如果为None则使用配置的message_field）
             stack_trace_column: 堆栈跟踪列名
 
         Returns:
             错误模式摘要
         """
+        # 使用配置的字段名或默认值
+        log_level_column = log_level_column or self.level_field
+        message_column = message_column or self.message_field
+
         if df.empty:
             return {"status": "no_data"}
 
@@ -795,6 +832,7 @@ class LogProcessor:
             "unique_patterns": len(patterns_with_examples),
             "patterns": patterns_with_examples
         }
+
 
     def process_incremental(
             self,
@@ -981,8 +1019,9 @@ class LogProcessor:
                 filtered_df = filtered_df[filtered_df["module"].str.contains(module_name, na=False)]
 
             # 按错误消息过滤
-            if error_message_contains and "message" in filtered_df.columns:
-                filtered_df = filtered_df[filtered_df["message"].str.contains(error_message_contains, na=False)]
+            if error_message_contains and self.message_field in filtered_df.columns:
+                filtered_df = filtered_df[
+                    filtered_df[self.message_field].str.contains(error_message_contains, na=False)]
 
             return filtered_df
 
@@ -1016,13 +1055,13 @@ class LogProcessor:
 
                 # 统计日志级别分布
                 level_distribution = {}
-                if "log_level" in group.columns:
-                    level_distribution = group["log_level"].value_counts().to_dict()
+                if self.level_field in group.columns:
+                    level_distribution = group[self.level_field].value_counts().to_dict()
 
                 # 获取示例消息
                 example_message = None
-                if "message" in group.columns:
-                    example_message = group["message"].iloc[0]
+                if self.message_field in group.columns:
+                    example_message = group[self.message_field].iloc[0]
 
                 # 时间范围
                 time_range = {}
@@ -1034,8 +1073,8 @@ class LogProcessor:
 
                 # 是否包含异常
                 contains_errors = False
-                if "log_level" in group.columns:
-                    contains_errors = any(level in ["ERROR", "FATAL"] for level in group["log_level"])
+                if self.level_field in group.columns:
+                    contains_errors = any(level in ["ERROR", "FATAL"] for level in group[self.level_field])
 
                 clusters[str(cluster_id)] = {
                     "count": len(group),

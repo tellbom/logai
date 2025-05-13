@@ -59,9 +59,9 @@ class AppConfig:
             #添加字段映射
             "field_mappings": {
                 "timestamp_field": "@timestamp",  # 默认时间戳字段
-                "message_field": "message",  # 默认消息字段
-                "level_field": "log_level",  # 默认日志级别字段
-                "service_field": "service_name"  # 默认服务名称字段
+                "message_field": "log_content",  # 默认消息字段
+                "level_field": "severity",  # 默认日志级别字段
+                "service_field": "app_name"  # 默认服务名称字段
             },
 
             # elasticsearch配置 - 源库（日志数据库）

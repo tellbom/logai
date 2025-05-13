@@ -21,17 +21,19 @@ class LogPreprocessor:
                 r"Traceback \(most recent call last\):"
             ],
             max_stack_depth: int = 30,
-            max_message_length: int = 10000
+            max_message_length: int = 10000,
+            field_mappings: Optional[Dict[str, str]] = None
     ):
         """
         初始化日志预处理器
 
         Args:
-            time_pattern: 时间戳正则表达式模式
-            log_level_pattern: 日志级别正则表达式模式
-            exception_patterns: 异常识别正则表达式模式列表
-            max_stack_depth: 最大堆栈深度，用于提取堆栈跟踪
-            max_message_length: 最大消息长度，超过将被截断
+            time_pattern:
+            log_level_pattern:
+            exception_patterns:
+            max_stack_depth:
+            max_message_length:
+            field_mappings: 字段映射配置，包含字段名映射
         """
         self.time_pattern = re.compile(time_pattern)
         self.log_level_pattern = re.compile(log_level_pattern)
@@ -39,17 +41,25 @@ class LogPreprocessor:
         self.max_stack_depth = max_stack_depth
         self.max_message_length = max_message_length
 
-    def preprocess(self, df: pd.DataFrame, message_column: str = "message") -> pd.DataFrame:
+        # 设置字段映射
+        self.field_mappings = field_mappings or {}
+        self.message_field = self.field_mappings.get("message_field", "message")
+        self.level_field = self.field_mappings.get("level_field", "log_level")
+
+    def preprocess(self, df: pd.DataFrame, message_column: str = None) -> pd.DataFrame:
         """
         预处理日志DataFrame
 
         Args:
             df: 包含日志数据的DataFrame
-            message_column: 消息列名
+            message_column: 消息列名，如果为None则使用配置的message_field
 
         Returns:
             预处理后的DataFrame
         """
+        # 使用配置的字段或提供的参数
+        message_column = message_column or self.message_field
+
         if df.empty:
             logger.warning("DataFrame为空，无法进行预处理")
             return df
@@ -69,7 +79,7 @@ class LogPreprocessor:
         logger.info(f"开始预处理 {len(result_df)} 条日志记录")
 
         # 提取日志级别
-        result_df["log_level"] = result_df[message_column].apply(self._extract_log_level)
+        result_df[self.level_field] = result_df[message_column].apply(self._extract_log_level)
 
         # 提取时间戳
         if "timestamp" not in result_df.columns:
@@ -88,6 +98,7 @@ class LogPreprocessor:
 
         logger.info(f"预处理完成，处理了 {len(result_df)} 条日志记录")
         return result_df
+
 
     def _extract_log_level(self, text: str) -> str:
         """
@@ -207,17 +218,20 @@ class LogPreprocessor:
 
         return cleaned_text
 
-    def extract_structured_data(self, df: pd.DataFrame, message_column: str = "message") -> pd.DataFrame:
+    def extract_structured_data(self, df: pd.DataFrame, message_column: str = None) -> pd.DataFrame:
         """
         从日志消息中提取结构化数据
 
         Args:
             df: 包含日志数据的DataFrame
-            message_column: 消息列名
+            message_column: 消息列名，如果为None则使用配置的message_field
 
         Returns:
             添加了结构化数据列的DataFrame
         """
+        # 使用配置的字段或提供的参数
+        message_column = message_column or self.message_field
+
         if df.empty:
             return df
 
@@ -249,6 +263,7 @@ class LogPreprocessor:
         result_df = result_df.drop(columns=["extracted_json", "extracted_keyvalue"], errors="ignore")
 
         return result_df
+
 
     def _extract_json(self, text: str) -> Dict[str, Any]:
         """
@@ -315,18 +330,30 @@ class LogPreprocessor:
 
         return kv_data
 
-    def normalize_exceptions(self, df: pd.DataFrame, message_column: str = 'message') -> pd.DataFrame:
+    def normalize_exceptions(
+            self,
+            df: pd.DataFrame,
+            message_column: str = None
+    ) -> pd.DataFrame:
         """
         针对各种类型的异常进行标准化处理
 
         Args:
             df: 日志DataFrame
-            message_column: 消息列名
+            message_column: 消息列名，如果为None则使用配置的message_field
 
         Returns:
             标准化后的DataFrame
         """
+        # 使用配置的字段或提供的参数
+        message_column = message_column or self.message_field
+
         if df.empty:
+            return df
+
+        # 检查消息列是否存在
+        if message_column not in df.columns:
+            logger.error(f"消息列 '{message_column}' 不在DataFrame中")
             return df
 
         # 创建副本
@@ -375,7 +402,6 @@ class LogPreprocessor:
             result_df = result_df.drop(columns=[f'{exception_type}_match'])
 
         # 创建统一的异常字段
-        # 从各种特定类型的异常字段中提取信息，合并到通用字段
         result_df['exception_type'] = None
         result_df['exception_class'] = None
         result_df['exception_message'] = None
