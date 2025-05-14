@@ -188,7 +188,7 @@ class ESConnector:
         logger.info(f"成功从ES提取 {len(df)} 条日志记录")
         return df
 
-    # 在data/es_connector.py中
+
     def save_to_new_index(
             self,
             df: pd.DataFrame,
@@ -199,18 +199,24 @@ class ESConnector:
     ) -> Tuple[int, int]:
         """
         将DataFrame数据保存到新的ES索引
+
+        Args:
+            df: DataFrame数据
+            target_index: 目标索引名称
+            id_column: ID列名
+            batch_size: 批处理大小
+            field_mappings: 字段映射，键是DataFrame中的列名，值是ES中的目标字段名
         """
         if df.empty:
             logger.warning("没有数据需要保存到ES")
             return 0, 0
 
-        # 应用字段映射（如果提供）
+        # 应用字段映射（正确实现）
         field_map = {}
         if field_mappings:
-            # 反向映射 - 源字段到目标字段
-            for target_field, source_field in field_mappings.items():
-                if source_field in df.columns:
-                    field_map[source_field] = target_field
+            # 直接使用提供的映射，不做任何反向操作
+            field_map = field_mappings
+            logger.info(f"使用字段映射: {field_map}")
 
         # 检查目标索引是否存在，如果不存在则创建
         if not self.es_client.indices.exists(index=target_index):
@@ -242,10 +248,10 @@ class ESConnector:
                         # 跳过所有元数据字段
                         continue
 
-                    # 应用字段映射
-                    target_col = field_map.get(col, col)  # 如果没有映射，保持原样
+                    # 应用字段映射 - 将DataFrame列映射到ES字段
+                    target_col = field_map.get(col, col)  # 如果没有映射，保留原列名
 
-                    # 处理其他字段的数据类型
+                    # 处理数据类型
                     if pd.isna(val):
                         doc[target_col] = None
                     elif isinstance(val, (pd.Timestamp, datetime.datetime)):

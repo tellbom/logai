@@ -55,10 +55,13 @@ class LogProcessor:
         self.service_field = self.field_mappings.get("service_field", "service_name")
         # 注意：timestamp_field 仍然使用 @timestamp
 
-        # 创建输出目录
-        if create_output_dir and not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-            logger.info(f"创建输出目录: {output_dir}")
+        # 创建输出目录 - 使用 exist_ok=True 确保不会因为目录已存在而报错
+        if create_output_dir:
+            try:
+                os.makedirs(self.output_dir, exist_ok=True)
+                logger.info(f"创建或确认输出目录存在: {output_dir}")
+            except Exception as e:
+                logger.error(f"创建输出目录失败: {str(e)}")
 
         # 状态跟踪
         self.last_processed_timestamp = None
@@ -87,9 +90,17 @@ class LogProcessor:
         """保存最后处理的时间戳到文件"""
         if self.last_processed_timestamp:
             try:
+                # 确保输出目录存在
+                os.makedirs(os.path.dirname(self.timestamp_file), exist_ok=True)
+
+                # 转换为字符串（如果是Timestamp对象）
+                timestamp_str = self.last_processed_timestamp
+                if hasattr(self.last_processed_timestamp, 'isoformat'):
+                    timestamp_str = self.last_processed_timestamp.isoformat()
+
                 with open(self.timestamp_file, "w") as f:
-                    f.write(self.last_processed_timestamp)
-                logger.info(f"已保存最后处理时间戳: {self.last_processed_timestamp}")
+                    f.write(timestamp_str)
+                logger.info(f"已保存最后处理时间戳: {timestamp_str}")
             except Exception as e:
                 logger.error(f"保存时间戳失败: {str(e)}")
 
@@ -564,6 +575,128 @@ class LogProcessor:
             logger.error(traceback.format_exc())
             return df, {"status": "error", "message": str(e)}
 
+    # 在 processing/extractor.py 中添加一个正则预筛选去重方法
+
+    def prefilter_duplicates(
+            self,
+            df: pd.DataFrame,
+            message_column: str = None,
+            timestamp_column: str = "@timestamp",
+            time_window_minutes: int = 60,
+            pattern_column: str = "pattern_group"
+    ) -> pd.DataFrame:
+        """
+        使用正则表达式和模式匹配对日志进行预筛选去重，
+        这比向量化去重更高效，可以先快速过滤掉明显的重复日志。
+
+        Args:
+            df: 输入的DataFrame
+            message_column: 消息列，如果为None则使用self.message_field
+            timestamp_column: 时间戳列
+            time_window_minutes: 时间窗口（分钟）
+            pattern_column: 存储模式组的列名
+
+        Returns:
+            去重后的DataFrame
+        """
+        import re
+        from collections import defaultdict
+
+        # 如果DataFrame为空，直接返回
+        if df.empty:
+            return df
+
+        # 使用配置的字段名或默认值
+        message_column = message_column or self.message_field
+
+        # 确保消息列存在
+        if message_column not in df.columns:
+            logger.warning(f"消息列 '{message_column}' 不在DataFrame中，跳过预筛选去重")
+            return df
+
+        # 记录原始数量
+        original_count = len(df)
+        logger.info(f"开始正则预筛选去重，原始记录数: {original_count}")
+
+        # 1. 替换常见的变量模式
+        patterns = [
+            (r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '<IP>'),  # IP地址
+            (r'\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b', '<UUID>'),  # UUID
+            (r'\b\d{4}-\d{2}-\d{2}\b', '<DATE>'),  # 日期
+            (r'\b\d{2}:\d{2}:\d{2}(?:\.\d+)?\b', '<TIME>'),  # 时间
+            (r'(?<=[^A-Za-z0-9])(\d+)(?=[^A-Za-z0-9]|$)', '<NUM>'),  # 数字
+            (r'\b([a-zA-Z]:\\(?:[^\\/:*?"<>|\r\n]+\\)*[^\\/:*?"<>|\r\n]*)', '<PATH>'),  # Windows路径
+            (r'\b((?:/[^/:*?"<>|\r\n]+)+/?)', '<PATH>'),  # Unix路径
+            (r'([\'"])(?:(?=(\\?))\2.)*?\1', '<STR>')  # 字符串
+        ]
+
+        # 创建一个新列存储模式化后的消息
+        df[pattern_column] = df[message_column].copy()
+
+        # 应用模式替换
+        for pattern, replacement in patterns:
+            df[pattern_column] = df[pattern_column].str.replace(pattern, replacement, regex=True)
+
+        # 2. 按时间窗口和服务名称分组处理
+        # 如果时间戳列存在，添加时间窗口分组标识
+        if timestamp_column in df.columns:
+            # 确保timestamp列是datetime类型
+            if not pd.api.types.is_datetime64_any_dtype(df[timestamp_column]):
+                try:
+                    df[timestamp_column] = pd.to_datetime(df[timestamp_column])
+                except:
+                    logger.warning(f"无法将{timestamp_column}列转换为datetime类型，不进行时间窗口分组")
+
+            # 添加时间窗口标识
+            if pd.api.types.is_datetime64_any_dtype(df[timestamp_column]):
+                # 按时间窗口分组，例如每小时一组
+                df['time_window'] = df[timestamp_column].dt.floor(f'{time_window_minutes}min')
+
+        # 组合分组键，优先考虑服务名+时间窗口
+        group_keys = []
+        if self.service_field in df.columns:
+            group_keys.append(self.service_field)
+        if 'time_window' in df.columns:
+            group_keys.append('time_window')
+
+        # 如果没有可用的分组键，直接使用模式分组
+        if not group_keys:
+            logger.info("未找到服务名或时间窗口字段，仅使用模式去重")
+            # 获取每个模式的第一次出现
+            df_deduplicated = df.drop_duplicates(subset=[pattern_column])
+
+            dedup_count = original_count - len(df_deduplicated)
+            logger.info(f"正则预筛选去重完成: 从{original_count}条记录中去除了{dedup_count}条重复记录")
+
+            # 清理临时列
+            df_deduplicated = df_deduplicated.drop(columns=[pattern_column])
+            return df_deduplicated
+
+        # 按分组进行去重
+        result_dfs = []
+
+        for group_name, group_df in df.groupby(group_keys):
+            # 获取每个分组内每个模式的第一次出现
+            group_deduped = group_df.drop_duplicates(subset=[pattern_column])
+            result_dfs.append(group_deduped)
+
+        # 合并结果
+        df_deduplicated = pd.concat(result_dfs)
+
+        # 计算去重数量
+        dedup_count = original_count - len(df_deduplicated)
+        logger.info(f"正则预筛选去重完成: 从{original_count}条记录中去除了{dedup_count}条重复记录")
+
+        # 清理临时列
+        if 'time_window' in df_deduplicated.columns:
+            df_deduplicated = df_deduplicated.drop(columns=['time_window'])
+
+        df_deduplicated = df_deduplicated.drop(columns=[pattern_column])
+
+        return df_deduplicated
+
+    # 修改 extract_and_process 方法，添加正则预筛选去重步骤
+
     def extract_and_process(
             self,
             start_time: Optional[datetime.datetime] = None,
@@ -574,24 +707,12 @@ class LogProcessor:
             save_to_es: bool = True,
             target_index: Optional[str] = None,
             preprocess: bool = True,
-            deduplication: bool = True  # 添加这个参数
+            deduplication: bool = True,
+            prefilter: bool = True,  # 新增参数：是否使用正则预筛选去重
+            time_window_minutes: int = 30
     ) -> Tuple[pd.DataFrame, Dict]:
         """
         提取并处理日志的便捷方法
-
-        Args:
-            start_time: 开始时间
-            end_time: 结束时间
-            max_logs: 最大提取日志数
-            query_filter: 额外的查询过滤条件
-            save_to_file: 是否保存结果到文件
-            save_to_es: 是否保存结果到ES
-            target_index: 目标ES索引名称
-            preprocess: 是否进行预处理
-            deduplication: 是否进行去重
-
-        Returns:
-            处理后的DataFrame和处理结果信息
         """
         # 如果没有指定开始时间，使用上次处理的时间戳
         if not start_time and self.last_processed_timestamp:
@@ -614,8 +735,10 @@ class LogProcessor:
             return logs_df, {"status": "no_data"}
 
         start_process_time = datetime.datetime.now()
+        dedup_stats = {"original_count": len(logs_df)}
 
         # 预处理
+        result_df = logs_df.copy()  # 创建一个初始结果DataFrame
         if preprocess:
             # 导入预处理器
             from processing.preprocessor import LogPreprocessor
@@ -624,34 +747,56 @@ class LogProcessor:
             preprocessor = LogPreprocessor(field_mappings=self.field_mappings)
 
             # 使用配置的字段名
-            logs_df = preprocessor.preprocess(logs_df, message_column=self.message_field)
+            result_df = preprocessor.preprocess(result_df, message_column=self.message_field)
 
             # 使用更通用的异常处理
-            logs_df = preprocessor.normalize_exceptions(logs_df, message_column=self.message_field)
+            result_df = preprocessor.normalize_exceptions(result_df, message_column=self.message_field)
             logger.info("执行了异常日志标准化")
 
+        # 正则预筛选去重 - 在向量化之前进行，节省资源
+        if prefilter and deduplication:
+            logger.info("开始使用正则预筛选去重...")
+            prefilter_count = len(result_df)
+            result_df = self.prefilter_duplicates(
+                result_df,
+                message_column=self.message_field,
+                time_window_minutes=time_window_minutes  # 30分钟时间窗口
+            )
+            prefilter_reduced = prefilter_count - len(result_df)
+            logger.info(f"正则预筛选去重减少了 {prefilter_reduced} 条记录")
+
+            # 添加到统计信息
+            dedup_stats["prefilter_count"] = prefilter_count
+            dedup_stats["prefilter_reduced"] = prefilter_reduced
+            dedup_stats["after_prefilter"] = len(result_df)
+
         # 如果启用去重，在解析日志前进行智能聚类去重
-        if deduplication and not logs_df.empty:
-            original_count = len(logs_df)
+        if deduplication and not result_df.empty:
+            original_count = len(result_df)
+            dedup_stats["before_vector_dedup"] = original_count
 
             # 确保日志具有向量表示
-            if 'vector' not in logs_df.columns and hasattr(self, 'embedding_model'):
+            if 'vector' not in result_df.columns and hasattr(self, 'embedding_model'):
                 # 调用嵌入模型获取向量
                 from processing.vectorizer import LogVectorizer
                 vectorizer = LogVectorizer(self.embedding_model)
                 # 使用配置的消息字段而非硬编码的 'message'
-                logs_df = vectorizer.add_vectors_to_df(logs_df, content_column=self.message_field)
+                result_df = vectorizer.add_vectors_to_df(result_df, content_column=self.message_field)
 
             # 应用智能聚类去重
-            if 'vector' in logs_df.columns:
-                logs_df = self.deduplicator.smart_cluster_deduplication(logs_df)
-                dedup_count = original_count - len(logs_df)
-                logger.info(f"日志去重完成: 从{original_count}条日志中去除了{dedup_count}条重复日志")
+            if 'vector' in result_df.columns:
+                result_df = self.deduplicator.smart_cluster_deduplication(result_df)
+                dedup_count = original_count - len(result_df)
+                logger.info(f"向量去重完成: 从{original_count}条日志中去除了{dedup_count}条重复日志")
+
+                # 添加到统计信息
+                dedup_stats["vector_dedup_reduced"] = dedup_count
+                dedup_stats["after_vector_dedup"] = len(result_df)
             else:
                 logger.warning("日志数据缺少向量表示，无法执行智能去重")
 
         # 解析日志 - 使用配置的消息字段
-        parsed_df, parsing_summary = self.parse_logs(logs_df, content_column=self.message_field)
+        parsed_df, parsing_summary = self.parse_logs(result_df, content_column=self.message_field)
 
         # 检测异常
         anomaly_df, anomaly_summary = self.detect_anomalies(parsed_df, template_column="template")
@@ -671,7 +816,12 @@ class LogProcessor:
 
         # 更新最后处理的时间戳
         if not clustered_df.empty and "@timestamp" in clustered_df.columns:
-            self.last_processed_timestamp = clustered_df["@timestamp"].max()
+            # 获取最大时间戳并确保它是字符串格式
+            max_timestamp = clustered_df["@timestamp"].max()
+            if hasattr(max_timestamp, 'isoformat'):
+                self.last_processed_timestamp = max_timestamp.isoformat()
+            else:
+                self.last_processed_timestamp = str(max_timestamp)
             self.save_last_timestamp()
 
         # 创建完整的处理结果摘要
@@ -686,6 +836,7 @@ class LogProcessor:
                 "end_time": end_process_time.isoformat(),
                 "duration_seconds": process_duration
             },
+            "deduplication": dedup_stats,
             "parsing": parsing_summary,
             "anomaly_detection": anomaly_summary,
             "clustering": clustering_summary,
@@ -700,34 +851,89 @@ class LogProcessor:
             processing_summary["output_file"] = output_file
 
         # 保存结果到ES
-        if save_to_es and target_index:
+        if save_to_es:
             # 如果未指定目标索引，使用默认值
             if target_index is None:
                 target_index = "logai-processed"
-            # 创建反向字段映射
-            reverse_field_mappings = None
-            if self.field_mappings:
-                reverse_field_mappings = {
-                    # 以配置的字段为目标字段
-                    "message": self.field_mappings.get("message_field", "message"),
-                    "log_level": self.field_mappings.get("level_field", "log_level"),
-                    "service_name": self.field_mappings.get("service_field", "service_name"),
-                    # 时间戳字段通常保持不变
-                    "@timestamp": "@timestamp"
+
+            # 确保索引存在并有正确的映射
+            if not self.target_es_connector.es_client.indices.exists(index=target_index):
+                # 创建索引并设置正确的IK分词器
+                settings = {
+                    "settings": {
+                        "number_of_shards": 1,
+                        "number_of_replicas": 0,
+                        "analysis": {
+                            "analyzer": {
+                                "ik_smart": {
+                                    "type": "custom",
+                                    "tokenizer": "ik_smart"
+                                },
+                                "ik_max_word": {
+                                    "type": "custom",
+                                    "tokenizer": "ik_max_word"
+                                }
+                            }
+                        }
+                    },
+                    "mappings": {
+                        "properties": {
+                            "@timestamp": {"type": "date"},
+                            "message": {
+                                "type": "text",
+                                "analyzer": "ik_smart",
+                                "search_analyzer": "ik_smart",
+                                "fields": {
+                                    "keyword": {"type": "keyword", "ignore_above": 256}
+                                }
+                            },
+                            "log_level": {"type": "keyword"},
+                            "service_name": {"type": "keyword"},
+                            "template": {
+                                "type": "text",
+                                "analyzer": "ik_smart",
+                                "fields": {
+                                    "keyword": {"type": "keyword", "ignore_above": 256}
+                                }
+                            },
+                            "cluster_id": {"type": "keyword"},
+                            "template_id": {"type": "keyword"}
+                        }
+                    }
                 }
+
+                # 创建索引
+                self.target_es_connector.es_client.indices.create(
+                    index=target_index,
+                    body=settings
+                )
+                logger.info(f"为目标索引 {target_index} 创建了正确的IK分词器映射")
+
+            # 创建字段映射 - 从DataFrame列名到ES标准字段名
+            field_mappings = {
+                self.message_field: "message",  # 源消息字段 → message
+                self.level_field: "log_level",  # 源级别字段 → log_level
+                self.service_field: "service_name",  # 源服务字段 → service_name
+                # 时间戳字段通常保持不变
+                "@timestamp": "@timestamp"
+            }
+
+            logger.info(f"保存到ES使用字段映射: {field_mappings}")
 
             total, success = self.target_es_connector.save_to_new_index(
                 clustered_df,
                 target_index=target_index,
-                field_mappings=reverse_field_mappings  # 传递字段映射
+                field_mappings=field_mappings
             )
             processing_summary["es_export"] = {
                 "total": total,
                 "success": success,
-                "target_index": target_index
+                "target_index": target_index,
+                "field_mappings": field_mappings
             }
 
         return clustered_df, processing_summary
+
 
     def extract_error_patterns(
             self,
@@ -841,7 +1047,9 @@ class LogProcessor:
             save_to_file: bool = True,
             save_to_es: bool = True,
             source_index_pattern: Optional[str] = None,
-            target_index: Optional[str] = None
+            target_index: Optional[str] = None,
+            prefilter: bool = True,  # Add this parameter
+            time_window_minutes: int = 30  # Add this parameter
     ):
         """增量处理日志"""
         # 获取配置
@@ -876,14 +1084,16 @@ class LogProcessor:
             logger.info("源索引无新数据，跳过处理")
             return pd.DataFrame(), {"status": "no_new_data"}
 
-        # 执行处理
+        # 执行处理，传递新增的参数
         return self.extract_and_process(
             start_time=start_time,
             end_time=end_time,
             max_logs=max_logs,
             save_to_file=save_to_file,
             save_to_es=save_to_es,
-            target_index=target_idx
+            target_index=target_idx,
+            prefilter=prefilter,  # Pass through prefilter parameter
+            time_window_minutes=time_window_minutes  # Pass through time_window_minutes parameter
         )
 
     def _get_latest_timestamp(self, index_pattern: str, is_source: bool = False) -> Optional[datetime.datetime]:
@@ -946,6 +1156,9 @@ class LogProcessor:
             output_file = os.path.join(self.output_dir, f"log_results_{timestamp}.json")
 
         try:
+            # 确保输出目录存在
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+
             # 将DataFrame转换为可序列化的格式
             # 处理特殊类型
             def serialize_value(v):
@@ -983,168 +1196,3 @@ class LogProcessor:
             import traceback
             logger.error(traceback.format_exc())
             return ""
-
-        def process_specific_errors(
-                self,
-                df: pd.DataFrame,
-                error_type: Optional[str] = None,
-                module_name: Optional[str] = None,
-                error_message_contains: Optional[str] = None
-        ) -> pd.DataFrame:
-            """
-            处理特定类型的错误
-
-            Args:
-                df: 日志DataFrame
-                error_type: 错误类型，如'System.NullReferenceException'
-                module_name: 模块名称
-                error_message_contains: 错误消息包含的文本
-
-            Returns:
-                过滤后的DataFrame
-            """
-            if df.empty:
-                return df
-
-            filtered_df = df.copy()
-
-            # 按错误类型过滤
-            if error_type and "exception_type" in filtered_df.columns:
-                filtered_df = filtered_df[filtered_df["exception_type"].str.contains(error_type, na=False)]
-
-            # 按模块名称过滤
-            if module_name and "exception_class" in filtered_df.columns:
-                # 从异常类名中提取模块
-                filtered_df["module"] = filtered_df["exception_class"].str.split(".").str[:-1].str.join(".")
-                filtered_df = filtered_df[filtered_df["module"].str.contains(module_name, na=False)]
-
-            # 按错误消息过滤
-            if error_message_contains and self.message_field in filtered_df.columns:
-                filtered_df = filtered_df[
-                    filtered_df[self.message_field].str.contains(error_message_contains, na=False)]
-
-            return filtered_df
-
-        def get_cluster_summary(
-                self,
-                df: pd.DataFrame,
-                cluster_id_column: str = "cluster_id"
-        ) -> Dict[str, Any]:
-            """
-            获取聚类摘要信息
-
-            Args:
-                df: 处理后的DataFrame
-                cluster_id_column: 聚类ID列名
-
-            Returns:
-                聚类摘要
-            """
-            if df.empty or cluster_id_column not in df.columns:
-                return {"status": "no_data"}
-
-            clusters = {}
-
-            # 按聚类ID分组
-            for cluster_id, group in df.groupby(cluster_id_column):
-                # 获取此聚类的模板
-                template = None
-                if "template" in group.columns:
-                    # 使用出现次数最多的模板
-                    template = group["template"].value_counts().index[0]
-
-                # 统计日志级别分布
-                level_distribution = {}
-                if self.level_field in group.columns:
-                    level_distribution = group[self.level_field].value_counts().to_dict()
-
-                # 获取示例消息
-                example_message = None
-                if self.message_field in group.columns:
-                    example_message = group[self.message_field].iloc[0]
-
-                # 时间范围
-                time_range = {}
-                if "@timestamp" in group.columns:
-                    time_range = {
-                        "earliest": group["@timestamp"].min(),
-                        "latest": group["@timestamp"].max()
-                    }
-
-                # 是否包含异常
-                contains_errors = False
-                if self.level_field in group.columns:
-                    contains_errors = any(level in ["ERROR", "FATAL"] for level in group[self.level_field])
-
-                clusters[str(cluster_id)] = {
-                    "count": len(group),
-                    "template": template,
-                    "level_distribution": level_distribution,
-                    "example_message": example_message,
-                    "time_range": time_range,
-                    "contains_errors": contains_errors
-                }
-
-            return {
-                "status": "success",
-                "total_clusters": len(clusters),
-                "clusters": clusters
-            }
-
-        def extract_template_variables(
-                self,
-                df: pd.DataFrame,
-                template_column: str = "template",
-                message_column: str = "message"
-        ) -> pd.DataFrame:
-            """
-            从日志中提取模板变量
-
-            Args:
-                df: 日志DataFrame
-                template_column: 模板列名
-                message_column: 消息列名
-
-            Returns:
-                添加了变量列的DataFrame
-            """
-            if df.empty or template_column not in df.columns or message_column not in df.columns:
-                return df
-
-            # 创建结果DataFrame
-            result_df = df.copy()
-            result_df["template_variables"] = None
-
-            # 对每个模板，创建正则表达式来提取变量
-            template_patterns = {}
-
-            for _, row in df.iterrows():
-                template = row[template_column]
-                message = row[message_column]
-
-                # 如果模板尚未处理
-                if template not in template_patterns:
-                    # 转义正则表达式特殊字符
-                    pattern_str = re.escape(template)
-
-                    # 替换变量占位符为捕获组
-                    pattern_str = pattern_str.replace("\\<NUM\\>", "([0-9]+)")
-                    pattern_str = pattern_str.replace("\\<IP\\>", "([0-9.]+)")
-                    pattern_str = pattern_str.replace("\\<PATH\\>", "([^\\s]+)")
-                    pattern_str = pattern_str.replace("\\<DATE\\>", "([0-9-]+)")
-                    pattern_str = pattern_str.replace("\\<TIME\\>", "([0-9:]+(?:\\.[0-9]+)?)")
-                    pattern_str = pattern_str.replace("\\<UUID\\>", "([0-9a-f-]+)")
-                    pattern_str = pattern_str.replace("\\<STR\\>", "([^\\s]+)")
-
-                    # 编译正则表达式
-                    template_patterns[template] = re.compile(f"^{pattern_str}$")
-
-                # 提取变量
-                pattern = template_patterns[template]
-                match = pattern.match(message)
-
-                if match:
-                    variables = match.groups()
-                    result_df.loc[_, "template_variables"] = json.dumps(variables)
-
-            return result_df

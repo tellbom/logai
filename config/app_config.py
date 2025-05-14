@@ -63,6 +63,11 @@ class AppConfig:
                 "level_field": "severity",  # 默认日志级别字段
                 "service_field": "app_name"  # 默认服务名称字段
             },
+            # 目标数据库字段固定使用以下标准字段:
+            # - "message" 存储日志内容
+            # - "log_level" 存储日志级别
+            # - "service_name" 存储服务名称
+            # - "@timestamp" 存储时间戳
 
             # elasticsearch配置 - 源库（日志数据库）
             "elasticsearch": {
@@ -142,13 +147,11 @@ class AppConfig:
             },
 
             # 检索配置
-            "retrieval": {
-                "hybrid_search": {
-                    "es_weight": 0.3,
-                    "vector_weight": 0.7,
-                    "top_k": 10,
-                    "rerank_url":"http://192.168.48.128:8091/rerank",  # 重排序服务URL
-                }
+            "hybrid_search": {
+                "es_weight": 0.3,
+                "vector_weight": 0.7,
+                "top_k": 10,
+                "rerank_url":"http://192.168.48.128:8091/rerank",  # 重排序服务URL
             },
             # 日志去重配置
             "deduplication": {

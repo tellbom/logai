@@ -75,6 +75,8 @@ class DifyWorkflowQuery(BaseModel):
     log_levels: Optional[List[str]] = None
     time_range_start: Optional[datetime] = None
     time_range_end: Optional[datetime] = None
+    include_vectors: bool = True
+    include_prompt: bool = True  # 添加参数：是否包含 LLM 提示词
 
     class Config:
         json_encoders = {
@@ -137,6 +139,7 @@ class WeightUpdateRequest(BaseModel):
     vector_weight: Optional[float] = Field(None, ge=0.0, le=1.0, description="向量搜索权重")
     weights_config: Optional[Union[Dict[str, Any], str]] = Field(None,
                                                                  description="LLM分析的权重配置，可以是JSON字符串或字典")
+    disable_dynamic_weights: bool = Field(True, description="是否禁用动态权重调整")  # 新增参数
 
 
 # 全局组件实例
@@ -153,7 +156,7 @@ pattern_analyzer = None
 
 # 初始化全局组件
 def initialize_components():
-    global es_connector, vector_store, embedding_model, log_processor, log_vectorizer
+    global es_connector, vector_store,target_es_connector, embedding_model, log_processor, log_vectorizer
     global hybrid_search, query_processor, anomaly_detector, pattern_analyzer
 
     # 获取配置
@@ -251,17 +254,17 @@ def initialize_components():
     )
 
     # 初始化混合搜索
-    retrieval_config = config.get("retrieval", {})
-    hybrid_search_config = retrieval_config.get("hybrid_search", {})
+    hybrid_search_config = config.get("hybrid_search", {})
     hybrid_search = HybridSearch(
-        es_connector=target_es_connector,
+        es_connector=es_connector,
         vector_store=vector_store,
         embedding_model=embedding_model,
+        target_es_connector=target_es_connector,  # 添加这一行，传递目标ES连接器
         es_weight=hybrid_search_config.get("es_weight", 0.3),
         vector_weight=hybrid_search_config.get("vector_weight", 0.7),
         final_results_limit=hybrid_search_config.get("top_k", 20),
-        rerank_url = hybrid_search_config.get("rerank_url","http://localhost:8091/rerank"),  # 您的重排序服务URL
-        field_mappings={  # 添加这个字典
+        rerank_url=hybrid_search_config.get("rerank_url", "http://localhost:8091/rerank"),
+        field_mappings={
             "timestamp_field": timestamp_field,
             "message_field": message_field,
             "level_field": level_field,
@@ -312,6 +315,7 @@ def get_components():
         initialize_components()
     return {
         "es_connector": es_connector,
+        "target_es_connector": target_es_connector,
         "vector_store": vector_store,
         "embedding_model": embedding_model,
         "log_processor": log_processor,
@@ -544,7 +548,8 @@ def update_search_weights(
     # 记录原始权重
     old_weights = {
         "es_weight": hybrid_search.es_weight,
-        "vector_weight": hybrid_search.vector_weight
+        "vector_weight": hybrid_search.vector_weight,
+        "dynamic_weights": getattr(hybrid_search, "use_dynamic_weights", True)
     }
 
     # 确定新权重
@@ -592,7 +597,8 @@ def update_search_weights(
     # 更新权重
     hybrid_search.set_weights(
         es_weight=new_es_weight,
-        vector_weight=new_vector_weight
+        vector_weight=new_vector_weight,
+        disable_dynamic_weights=request.disable_dynamic_weights  # 传递是否禁用动态权重参数
     )
 
     # 构建响应
@@ -602,7 +608,8 @@ def update_search_weights(
         "old_weights": old_weights,
         "new_weights": {
             "es_weight": hybrid_search.es_weight,
-            "vector_weight": hybrid_search.vector_weight
+            "vector_weight": hybrid_search.vector_weight,
+            "dynamic_weights": getattr(hybrid_search, "use_dynamic_weights", False)
         }
     }
 
@@ -616,26 +623,89 @@ def update_search_weights(
 
     return response
 
+
+# 更新端点函数
 @app.post("/api/dify_workflow")
 def generate_dify_workflow_data(query: DifyWorkflowQuery, components: Dict = Depends(get_components)):
     """
-    生成用于Dify工作流的数据
+    生成用于 Dify 工作流的数据，包括搜索结果和 LLM 提示词
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     # 准备时间范围
     time_range = None
-    if query.time_range_start and query.time_range_end:
-        time_range = (query.time_range_start, query.time_range_end)
 
-    # 处理查询
-    result = components["query_processor"].generate_dify_workflow_data(
-        query=query.query,
-        filters=query.filters,
-        time_range=time_range,
-        services=query.services,
-        log_levels=query.log_levels
-    )
+    try:
+        # 如果提供了时间范围，则直接使用
+        if query.time_range_start and query.time_range_end:
+            logger.info(f"使用请求提供的时间范围: {query.time_range_start} 到 {query.time_range_end}")
 
-    return result
+            # 转换为字符串格式（如果需要）
+            start_str = query.time_range_start
+            if hasattr(query.time_range_start, 'isoformat'):
+                start_str = query.time_range_start.isoformat()
+
+            end_str = query.time_range_end
+            if hasattr(query.time_range_end, 'isoformat'):
+                end_str = query.time_range_end.isoformat()
+
+            # 确保时区信息
+            if isinstance(start_str, str) and not ('Z' in start_str or '+' in start_str):
+                start_str = start_str + 'Z'
+
+            if isinstance(end_str, str) and not ('Z' in end_str or '+' in end_str):
+                end_str = end_str + 'Z'
+
+            time_range = (start_str, end_str)
+
+        else:
+            # 使用默认时间范围（过去7天）
+            logger.info("使用默认时间范围（过去7天）")
+            now = datetime.utcnow()
+            one_week_ago = now - timedelta(days=7)
+
+            # 格式化为ISO格式字符串
+            start_str = one_week_ago.isoformat() + 'Z'
+            end_str = now.isoformat() + 'Z'
+
+            time_range = (start_str, end_str)
+
+        logger.info(f"最终时间范围: {time_range}")
+
+    except Exception as e:
+        logger.error(f"准备时间范围时出错: {str(e)}")
+        # 使用一个安全的默认值
+        now = datetime.utcnow()
+        one_week_ago = now - timedelta(days=7)
+        time_range = (one_week_ago.isoformat() + 'Z', now.isoformat() + 'Z')
+
+    try:
+        # 处理查询 - 传递所有参数
+        result = components["query_processor"].generate_dify_workflow_data(
+            query=query.query,
+            filters=query.filters,
+            time_range=time_range,
+            services=query.services,
+            log_levels=query.log_levels,
+            include_vectors=query.include_vectors,
+            include_prompt=query.include_prompt  # 传递新参数
+        )
+
+        return result
+
+    except Exception as e:
+        logger.error(f"生成 Dify 工作流数据时出错: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+        # 返回一个错误响应，而不是引发异常
+        return {
+            "status": "error",
+            "message": str(e),
+            "query": query.query,
+            "search_results": []
+        }
 
 
 @app.post("/api/process_logs")
@@ -936,7 +1006,7 @@ async def global_exception_handler(request: Request, exc: Exception):
 
 @app.post("/api/process_and_vectorize")
 def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = Depends(get_components),
-                          request: Optional[Dict[str, Any]] = None):
+                         request: Optional[Dict[str, Any]] = None):
     """处理并向量化日志数据"""
     if request is None:
         request = {}
@@ -951,6 +1021,10 @@ def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = 
     # 使用请求参数或配置值
     source_index = request.get("source_index", config.get("elasticsearch.index_pattern"))
     target_index = request.get("target_index", config.get("target_elasticsearch.index"))
+
+    # 获取去重配置
+    prefilter = request.get("prefilter", True)
+    time_window_minutes = request.get("time_window_minutes", 30)
 
     # 使用自定义时间范围或默认24小时时间窗口
     time_range_start = None
@@ -971,39 +1045,64 @@ def process_and_vectorize(background_tasks: BackgroundTasks, components: Dict = 
 
     # 使用后台任务
     def combined_task():
-        if time_range_start and time_range_end:
-            # 使用明确的时间范围
-            processed_df, summary = components["log_processor"].extract_and_process(
-                start_time=time_range_start,
-                end_time=time_range_end,
-                max_logs=10000,
-                save_to_file=True,
-                save_to_es=True,
-                target_index=target_index
-            )
-        else:
-            # 使用时间窗口
-            processed_df, summary = components["log_processor"].process_incremental(
-                time_window=time_window,
-                max_logs=10000,
-                save_to_file=True,
-                save_to_es=True,
-                source_index_pattern=source_index,
-                target_index=target_index
-            )
+        try:
+            if time_range_start and time_range_end:
+                # 使用明确的时间范围
+                processed_df, summary = components["log_processor"].extract_and_process(
+                    start_time=time_range_start,
+                    end_time=time_range_end,
+                    max_logs=10000,
+                    save_to_file=True,
+                    save_to_es=True,
+                    target_index=target_index,
+                    prefilter=prefilter,
+                    time_window_minutes=time_window_minutes
+                )
+            else:
+                # 使用时间窗口 - 确保所有参数都被正确传递
+                processed_df, summary = components["log_processor"].process_incremental(
+                    time_window=time_window,
+                    max_logs=10000,
+                    save_to_file=True,
+                    save_to_es=True,
+                    source_index_pattern=source_index,
+                    target_index=target_index,
+                    prefilter=prefilter,
+                    time_window_minutes=time_window_minutes
+                )
 
-        # 再向量化
-        if processed_df is not None and not processed_df.empty:
-            components["log_vectorizer"].process_dataframe(
-                processed_df,
-                content_column=message_field
-            )
+            # 再向量化
+            if processed_df is not None and not processed_df.empty:
+                components["log_vectorizer"].process_dataframe(
+                    processed_df,
+                    content_column=message_field
+                )
 
-        # 保存时间戳
-        components["log_processor"].save_last_timestamp()
+            # 保存时间戳
+            components["log_processor"].save_last_timestamp()
+
+            logger.info("处理并向量化任务完成")
+            return True
+        except Exception as e:
+            logger.error(f"处理并向量化任务失败: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
 
     background_tasks.add_task(combined_task)
-    return {"status": "success", "message": "增量处理和向量化任务已启动"}
+    return {
+        "status": "success",
+        "message": "增量处理和向量化任务已启动",
+        "config": {
+            "prefilter": prefilter,
+            "time_window_minutes": time_window_minutes,
+            "time_range": {
+                "start": time_range_start.isoformat() if time_range_start else None,
+                "end": time_range_end.isoformat() if time_range_end else None,
+                "time_window_hours": time_window.total_seconds() / 3600 if not time_range_start else None
+            }
+        }
+    }
 
 
 # 启动服务

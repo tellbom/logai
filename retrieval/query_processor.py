@@ -387,67 +387,115 @@ class QueryProcessor:
         """
         return self.default_prompt_template
 
+    # 修复 Dify Workflow 端点以包含 LLM 提示词
+
     def generate_dify_workflow_data(
             self,
             query: str,
             filters: Optional[Dict[str, Any]] = None,
-            time_range: Optional[Tuple[datetime, datetime]] = None,
+            time_range: Optional[Any] = None,
             services: Optional[List[str]] = None,
-            log_levels: Optional[List[str]] = None
+            log_levels: Optional[List[str]] = None,
+            include_vectors: bool = True,  # 是否包含向量搜索结果
+            include_prompt: bool = True  # 新参数：是否包含 LLM 提示词
     ) -> Dict[str, Any]:
         """
-        生成用于Dify工作流的数据
+        为 Dify 工作流生成数据，包括 LLM 提示词
 
         Args:
             query: 用户查询
             filters: 过滤条件
-            time_range: 时间范围
-            services: 服务列表
+            time_range: 时间范围(开始时间, 结束时间) - 可以是各种格式
+            services: 服务名列表
             log_levels: 日志级别列表
+            include_vectors: 是否包含向量搜索结果
+            include_prompt: 是否包含 LLM 提示词
 
         Returns:
-            Dify工作流数据
+            工作流数据包括搜索结果和 LLM 提示词
         """
-        # 处理查询，获取提示词和上下文
-        process_result = self.process_query(
-            query=query,
-            filters=filters,
-            return_search_results=True,
-            return_prompt=True,
-            time_range=time_range,
-            services=services,
-            log_levels=log_levels
-        )
+        import logging
+        logger = logging.getLogger(__name__)
 
-        if process_result["status"] != "success":
-            return {
-                "status": "error",
-                "message": process_result.get("message", "处理查询失败"),
-                "workflow_data": None
+        # 确保时间范围格式正确
+        processed_time_range = None
+        meta_time_range = {"start": None, "end": None}
+
+        if time_range:
+            logger.info(f"原始时间范围: {time_range}, 类型: {type(time_range)}")
+
+            # 如果是元组或列表
+            if isinstance(time_range, (tuple, list)) and len(time_range) >= 2:
+                start_time, end_time = time_range[0], time_range[1]
+                logger.info(f"解析时间范围: start={start_time}, end={end_time}")
+
+                # 记录元数据中的时间范围（用于响应）
+                meta_time_range["start"] = str(start_time)
+                meta_time_range["end"] = str(end_time)
+
+                # 保留原始时间范围格式
+                processed_time_range = time_range
+            else:
+                logger.warning(f"时间范围格式不正确: {time_range}")
+
+        try:
+            # 执行混合搜索
+            logger.info(f"执行混合搜索，include_vectors={include_vectors}")
+            search_results = self.hybrid_search.search(
+                query=query,
+                filters=filters,
+                include_vectors=include_vectors,  # 控制是否进行向量搜索
+                time_range=processed_time_range,
+                services=services,
+                log_levels=log_levels,
+            )
+
+            # 构建上下文和生成 LLM 提示词
+            context_data = {}
+            prompt = None
+
+            if include_prompt:
+                # 构建搜索结果上下文
+                context_data = self._build_context(search_results.get("results", []))
+
+                # 生成提示词
+                prompt = self._generate_prompt(query, context_data.get("context", ""))
+                logger.info(f"已生成 LLM 提示词，长度: {len(prompt) if prompt else 0} 字符")
+
+            # 准备工作流数据
+            workflow_data = {
+                "query": query,
+                "search_results": search_results.get("results", []),
+                "meta": {
+                    "total": search_results.get("total", 0),
+                    "es_results_count": search_results.get("es_results_count", 0),
+                    "vector_results_count": search_results.get("vector_results_count", 0),
+                    "time_range": meta_time_range
+                }
             }
 
-        # 准备Dify工作流数据
-        workflow_data = {
-            "query": query,
-            "prompt": process_result["prompt"],
-            "context": process_result["context_data"]["context"],
-            "sources": process_result["context_data"]["sources"],
-            "search_results": process_result.get("search_results", [])
-        }
+            # 添加提示词和上下文（如果有）
+            if include_prompt and prompt:
+                workflow_data["prompt"] = prompt
+                workflow_data["context_data"] = context_data
 
-        # 添加辅助信息，帮助Dify工作流处理
-        workflow_data["metadata"] = {
-            "token_estimate": process_result["context_data"].get("token_estimate", 0),
-            "query_intent": process_result["query_intent"],
-            "expanded_query": process_result["expanded_query"],
-            "result_count": len(process_result.get("search_results", [])),
-            "processing_time": process_result["processing_time"]
-        }
+            return workflow_data
 
-        return {
-            "status": "success",
-            "workflow_data": workflow_data
-        }
+        except Exception as e:
+            logger.error(f"生成 Dify 工作流数据出错: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+
+            # 返回一个基本的响应，而不是引发异常
+            return {
+                "query": query,
+                "search_results": [],
+                "meta": {
+                    "total": 0,
+                    "error": str(e),
+                    "time_range": meta_time_range
+                }
+            }
 
     def generate_time_parsing_prompt( self,query: str) -> str:
         """
