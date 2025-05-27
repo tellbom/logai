@@ -242,168 +242,265 @@ class QdrantVectorStore:
         return modified_filters
 
     # 修复 search_similar 方法使用正确的 Qdrant API
-
     def search_similar(
             self,
             query_vector: List[float],
             filter_conditions: Optional[Dict[str, Any]] = None,
             limit: int = 10,
-            score_threshold: float = 0.0
+            score_threshold: float = 0.0,
+            log_levels: Optional[List[str]] = ["ERROR", "WARN"]  # 新增参数：日志等级过滤
     ) -> List[Dict[str, Any]]:
         """
-        搜索相似向量 - 修复 Qdrant 客户端 API 调用
+        搜索相似向量 - 优化版本，使用客户端无过滤器搜索后手动过滤
+
+        Args:
+            query_vector: 查询向量
+            filter_conditions: 过滤条件
+            limit: 返回结果数量限制
+            score_threshold: 分数阈值
+            log_levels: 要过滤的日志等级列表（如 ["ERROR", "WARN"]）
+
+        Returns:
+            搜索结果列表
         """
-        import logging
-        import json
-        import requests
-        from typing import Dict, List, Any, Optional
-
-        logger = logging.getLogger(__name__)
-
         try:
             # 预处理过滤条件 - 特别处理时间戳
             if filter_conditions:
                 filter_conditions = self._handle_timestamp_filter(filter_conditions)
                 logger.info(f"处理后的过滤条件: {filter_conditions}")
 
-            # 将过滤条件转换为Qdrant兼容格式
-            qdrant_filter = None
-            if filter_conditions:
-                qdrant_filter = self._convert_filter_to_qdrant_format(filter_conditions)
-                logger.info(f"转换后的Qdrant过滤条件: {qdrant_filter}")
+            # 使用 Python 客户端进行搜索（不带过滤器）
+            # 由于需要手动过滤，获取更多结果以确保过滤后有足够的数据
+            search_limit = limit * 10 if filter_conditions else limit
 
-            # 尝试多种搜索方法
+            search_params = {
+                "collection_name": self.collection_name,
+                "query_vector": query_vector,
+                "limit": search_limit,
+                "with_payload": True,
+                "score_threshold": score_threshold
+            }
+
+            logger.info(f"执行向量搜索，初始限制: {search_limit}")
+            search_result = self.client.search(**search_params)
+
+            # 处理搜索结果
             results = []
-
-            # 方法1: 直接使用 REST API (绕过客户端可能的问题)
-            try:
-                # 构建 REST API 请求
-                api_url = f"http://{self.host}:{self.port}/collections/{self.collection_name}/points/search"
-
-                # 准备请求体
-                request_body = {
-                    "vector": query_vector,
-                    "limit": limit,
-                    "with_payload": True,
-                    "with_vectors": False
+            for point in search_result:
+                result = {
+                    "id": point.id,
+                    "score": float(point.score),
+                    "payload": point.payload
                 }
+                results.append(result)
 
-                # 添加过滤条件（如果有）
-                if qdrant_filter:
-                    request_body["filter"] = qdrant_filter
+            logger.info(f"搜索返回 {len(results)} 条记录")
 
-                logger.info(f"尝试方法1: 使用 REST API 直接调用，URL: {api_url}")
-                response = requests.post(
-                    api_url,
-                    json=request_body,
-                    headers={"Content-Type": "application/json"}
-                )
+            # 如果没有过滤条件且没有日志等级过滤，直接返回结果
+            if not filter_conditions and not log_levels:
+                return results[:limit]
 
-                if response.status_code == 200:
-                    # 解析响应
-                    response_data = response.json()
-                    if "result" in response_data:
-                        points = response_data["result"]
+            # 如果有日志等级过滤，添加到过滤条件中
+            if log_levels:
+                if filter_conditions is None:
+                    filter_conditions = {}
+                # 添加日志等级过滤条件
+                filter_conditions["metadata.log_level"] = log_levels
+                logger.info(f"添加日志等级过滤: {log_levels}")
 
-                        # 处理结果
-                        for point in points:
-                            result = {
-                                "id": point.get("id"),
-                                "score": float(point.get("score", 0.0)),
-                                "payload": point.get("payload", {})
-                            }
-                            results.append(result)
+            # 手动过滤结果
+            filtered_results = self._manual_filter_results(results, filter_conditions)
 
-                        logger.info(f"方法1成功，找到 {len(results)} 条记录")
-                        return results
-                else:
-                    logger.warning(f"REST API 调用失败: {response.status_code} - {response.text}")
-            except Exception as e:
-                error_msg = f"方法1失败: {str(e)}"
-                logger.warning(error_msg)
+            logger.info(f"过滤后剩余 {len(filtered_results)} 条记录")
 
-            # 方法2: 使用 Python 客户端但不使用过滤器
-            if not results:
-                try:
-                    # 准备搜索参数（不带过滤器）
-                    search_params = {
-                        "collection_name": self.collection_name,
-                        "query_vector": query_vector,
-                        "limit": limit,
-                        "with_payload": True
-                    }
-
-                    logger.info(f"尝试方法2: 使用 Python 客户端不带过滤器")
-                    search_result = self.client.search(**search_params)
-
-                    # 处理结果
-                    for point in search_result:
-                        result = {
-                            "id": point.id,
-                            "score": float(point.score),
-                            "payload": point.payload
-                        }
-                        results.append(result)
-
-                    logger.info(f"方法2成功，找到 {len(results)} 条记录")
-
-                    # 手动过滤结果
-                    if filter_conditions and len(results) > 0:
-                        filtered_results = []
-
-                        # 检查时间戳条件
-                        start_time = None
-                        end_time = None
-
-                        if "metadata.timestamp" in filter_conditions:
-                            timestamp_condition = filter_conditions["metadata.timestamp"]
-                            if "$gte" in timestamp_condition:
-                                start_time = timestamp_condition["$gte"]
-                            if "$lte" in timestamp_condition:
-                                end_time = timestamp_condition["$lte"]
-
-                        if start_time or end_time:
-                            logger.info(f"手动过滤时间戳: 开始={start_time}, 结束={end_time}")
-
-                            for result in results:
-                                # 检查结果是否在时间范围内
-                                include = True
-                                payload = result.get("payload", {})
-                                metadata = payload.get("metadata", {})
-
-                                # 尝试获取时间戳 (从不同可能的位置)
-                                timestamp = None
-                                if "timestamp" in metadata:
-                                    timestamp = metadata["timestamp"]
-                                elif "timestamp" in payload:
-                                    timestamp = payload["timestamp"]
-
-                                # 如果找到时间戳，检查范围
-                                if timestamp:
-                                    if start_time and timestamp < start_time:
-                                        include = False
-                                    if end_time and timestamp > end_time:
-                                        include = False
-
-                                if include:
-                                    filtered_results.append(result)
-
-                            logger.info(f"手动过滤后剩余 {len(filtered_results)} 条记录")
-                            return filtered_results
-
-                    # 如果没有时间戳过滤，返回所有结果
-                    return results
-                except Exception as e:
-                    error_msg = f"方法2失败: {str(e)}"
-                    logger.warning(error_msg)
-
-            return results
+            # 返回限制数量的结果
+            return filtered_results[:limit]
 
         except Exception as e:
-            logger.error(f"向量搜索总体失败: {str(e)}")
+            logger.error(f"向量搜索失败: {str(e)}")
             import traceback
             logger.error(traceback.format_exc())
             return []
+
+    def _manual_filter_results(
+            self,
+            results: List[Dict[str, Any]],
+            filter_conditions: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """
+        手动过滤搜索结果
+
+        Args:
+            results: 原始搜索结果
+            filter_conditions: 过滤条件
+
+        Returns:
+            过滤后的结果
+        """
+        filtered_results = []
+
+        # 解析过滤条件
+        filters = self._parse_filter_conditions(filter_conditions)
+
+        for result in results:
+            if self._check_result_matches_filters(result, filters):
+                filtered_results.append(result)
+
+        return filtered_results
+
+    def _parse_filter_conditions(
+            self,
+            filter_conditions: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        解析过滤条件，提取各种过滤参数
+
+        Args:
+            filter_conditions: 原始过滤条件
+
+        Returns:
+            解析后的过滤参数
+        """
+        filters = {
+            "timestamp": {"start": None, "end": None},
+            "exact_matches": {},
+            "list_matches": {}
+        }
+
+        for field, condition in filter_conditions.items():
+            # 处理时间戳条件
+            if "timestamp" in field.lower():
+                if isinstance(condition, dict):
+                    if "$gte" in condition:
+                        filters["timestamp"]["start"] = condition["$gte"]
+                    if "$gt" in condition:
+                        filters["timestamp"]["start"] = condition["$gt"]
+                    if "$lte" in condition:
+                        filters["timestamp"]["end"] = condition["$lte"]
+                    if "$lt" in condition:
+                        filters["timestamp"]["end"] = condition["$lt"]
+                    if "$eq" in condition:
+                        filters["timestamp"]["start"] = condition["$eq"]
+                        filters["timestamp"]["end"] = condition["$eq"]
+                else:
+                    # 单个时间戳值作为精确匹配
+                    filters["timestamp"]["start"] = condition
+                    filters["timestamp"]["end"] = condition
+
+            # 处理列表匹配条件
+            elif isinstance(condition, list):
+                filters["list_matches"][field] = condition
+
+            # 处理精确匹配条件
+            elif not isinstance(condition, dict):
+                filters["exact_matches"][field] = condition
+
+            # 处理其他范围条件（非时间戳）
+            elif isinstance(condition, dict):
+                for op, value in condition.items():
+                    if op == "$eq":
+                        filters["exact_matches"][field] = value
+
+        return filters
+
+    def _check_result_matches_filters(
+            self,
+            result: Dict[str, Any],
+            filters: Dict[str, Any]
+    ) -> bool:
+        """
+        检查单个结果是否匹配所有过滤条件
+
+        Args:
+            result: 搜索结果
+            filters: 解析后的过滤条件
+
+        Returns:
+            是否匹配
+        """
+        payload = result.get("payload", {})
+
+        # 检查时间戳过滤
+        if filters["timestamp"]["start"] or filters["timestamp"]["end"]:
+            timestamp = self._extract_timestamp(payload)
+
+            if timestamp is None:
+                return False
+
+            if filters["timestamp"]["start"] and timestamp < filters["timestamp"]["start"]:
+                return False
+
+            if filters["timestamp"]["end"] and timestamp > filters["timestamp"]["end"]:
+                return False
+
+        # 检查精确匹配
+        for field, expected_value in filters["exact_matches"].items():
+            actual_value = self._extract_field_value(payload, field)
+            if actual_value != expected_value:
+                return False
+
+        # 检查列表匹配
+        for field, allowed_values in filters["list_matches"].items():
+            actual_value = self._extract_field_value(payload, field)
+            if actual_value not in allowed_values:
+                return False
+
+        return True
+
+    def _extract_timestamp(self, payload: Dict[str, Any]) -> Optional[str]:
+        """
+        从payload中提取时间戳
+
+        Args:
+            payload: 数据负载
+
+        Returns:
+            时间戳字符串或None
+        """
+        # 尝试多个可能的时间戳位置
+        timestamp_paths = [
+            ["metadata", "timestamp"],
+            ["timestamp"],
+            ["metadata", "time"],
+            ["time"]
+        ]
+
+        for path in timestamp_paths:
+            value = payload
+            for key in path:
+                if isinstance(value, dict) and key in value:
+                    value = value[key]
+                else:
+                    value = None
+                    break
+
+            if value is not None:
+                return value
+
+        return None
+
+    def _extract_field_value(self, payload: Dict[str, Any], field: str) -> Any:
+        """
+        从payload中提取字段值，支持嵌套路径
+
+        Args:
+            payload: 数据负载
+            field: 字段路径（如 "metadata.log_level"）
+
+        Returns:
+            字段值或None
+        """
+        # 分割字段路径
+        path_parts = field.split(".")
+
+        value = payload
+        for part in path_parts:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            else:
+                return None
+
+        return value
 
     def _convert_filter_to_qdrant_format(self, filter_conditions: Dict[str, Any]) -> Dict[str, Any]:
         """

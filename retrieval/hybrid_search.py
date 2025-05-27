@@ -16,6 +16,8 @@ from data.es_connector import ESConnector
 from data.vector_store import QdrantVectorStore
 from utils import get_logger, clean_text
 
+from .hybrid_search_merger import HybridSearchMerger
+
 logger = get_logger(__name__)
 
 
@@ -48,6 +50,7 @@ class HybridSearch:
             final_results_limit: int = 20,
             field_mappings: Optional[Dict[str, str]] = None,
             use_dynamic_weights: bool = True  # 添加控制动态权重的开关
+
     ):
         """
         初始化混合搜索
@@ -75,6 +78,9 @@ class HybridSearch:
         self.level_field = self.field_mappings.get("level_field", "log_level")
         self.service_field = self.field_mappings.get("service_field", "service_name")
         self.timestamp_field = self.field_mappings.get("timestamp_field", "@timestamp")
+
+        # 初始化结果合并器
+        self.merger = HybridSearchMerger()
 
         logger.info(f"HybridSearch接收到的字段映射: {self.field_mappings}")
         logger.info(
@@ -183,6 +189,20 @@ class HybridSearch:
             "search_time": search_time,
             "results": combined_results
         }
+
+    def _merge_final_results(self, query: str, es_results: List[Dict],
+                             vector_results: List[Dict], reranked_results: List[Dict]) -> List[Dict]:
+        """使用新的合并器"""
+        return self.merger._merge_final_results(
+            query=query,
+            es_results=es_results,
+            vector_results=vector_results,
+            reranked_results=reranked_results,
+            es_weight=self.es_weight,
+            vector_weight=self.vector_weight,
+            rerank_weight=self.rerank_weight,
+            final_results_limit=self.final_results_limit
+        )
 
     def _merge_initial_results(
             self,
@@ -296,58 +316,7 @@ class HybridSearch:
             logger.error(traceback.format_exc())
             return []
 
-    def _merge_final_results(self, query: str, es_results: List[Dict], vector_results: List[Dict],
-                             reranked_results: List[Dict]) -> List[Dict]:
-        """改进的结果合并算法"""
-        # 创建基础合并结果
-        result_map = self._create_base_result_map(es_results, vector_results, reranked_results)
-        combined_results = list(result_map.values())
 
-        if not combined_results:
-            return []
-
-        # 计算动态权重
-        es_weight, vector_weight, rerank_weight = self._get_dynamic_weights(query, es_results, vector_results)
-
-        # 计算TF-IDF相关性
-        tfidf_scores = self._calculate_tfidf_relevance(query, combined_results)
-
-        # 计算上下文分数
-        context_scores = self._calculate_context_score(combined_results)
-
-        # 整合所有分数
-        for result in combined_results:
-            # 基础分数
-            base_score = (
-                    es_weight * result.get("es_score", 0.0) +
-                    vector_weight * result.get("vector_score", 0.0) +
-                    rerank_weight * result.get("rerank_score", 0.0)
-            )
-
-            # 日志级别权重
-            level_importance = self._get_level_importance(result.get("log_level", "INFO"))
-
-            # TF-IDF相关性
-            tfidf_score = tfidf_scores.get(result["id"], 0.0)
-
-            # 上下文相关性
-            context_score = context_scores.get(result["id"], 1.0)
-
-            # 最终分数计算
-            result["final_score"] = base_score * (
-                        0.7 + 0.1 * level_importance + 0.1 * tfidf_score + 0.1 * context_score)
-
-        # 排序和限制结果
-        combined_results.sort(key=lambda x: x["final_score"], reverse=True)
-        combined_results = combined_results[:self.final_results_limit]
-
-        # 添加排名和相关性信息
-        for i, result in enumerate(combined_results):
-            result["rank"] = i + 1
-
-        self._add_relevance_info(query, combined_results)
-
-        return combined_results
 
     # Enhanced _prepare_es_filters method with robust fallback for timestamp_field
 
